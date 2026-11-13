@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="katka-gateway" content="">
+<title>KATKA</title>
+<style>
+* { box-sizing: border-box }
+html, body { margin: 0; background: #20221e; color: #f3e6c7; font: 17px/1.4 "Segoe UI", sans-serif }
+main { border: 1px solid #8e876b; border-top: 4px solid #d3b275; padding: 20px 24px 22px }
+h1 { margin: 0; font: bold 25px/1.15 Georgia, serif }
+#server { margin: 8px 0 18px; color: #c5c4ae }
+label { display: block; margin-bottom: 6px }
+.row { display: flex; gap: 8px; flex-wrap: wrap }
+input, button { min-height: 40px; border: 1px solid #706e5b; border-radius: 3px; font: inherit }
+input { background: #141712; color: #f3e6c7; width: 13em; padding: 6px 10px; font-family: Consolas, monospace; text-transform: uppercase }
+button { cursor: pointer; color: #20221e; background: #d7bf88; padding: 6px 12px; font-weight: 600 }
+button.secondary { color: #e5dbc0; background: #34362e }
+button:disabled { opacity: .55; cursor: default }
+:focus-visible { outline: 2px solid #fff4cb; outline-offset: 2px }
+#status { margin: 0 0 10px; color: #acd8ad }
+#message { margin: 10px 0 0; color: #efcf9f }
+#message:empty { display: none }
+</style>
+<main>
+  <h1>KATKA — уведомления о матче</h1>
+  <p id="server" role="status">Проверяем соединение…</p>
+  <form id="pair" hidden>
+    <label for="code">Код из Telegram</label>
+    <div class="row">
+      <input id="code" type="text" maxlength="16" minlength="16" pattern="[0-9A-Fa-f]{16}" required autocomplete="off" spellcheck="false">
+      <button id="bind">Подключить</button>
+    </div>
+  </form>
+  <section id="linked" hidden>
+    <p id="status">Telegram подключён</p>
+    <div class="row">
+      <button type="button" id="test">Проверить уведомление</button>
+      <button type="button" class="secondary" id="unlink">Отключить Telegram</button>
+    </div>
+  </section>
+  <p id="message" role="status" aria-live="polite"></p>
+</main>
+<script>
+'use strict';
+const element = id => document.getElementById(id);
+let generation = null;
+let busy = false;
+let known = false;
+let online = false;
+let identity;
+
+function installationKey() {
+  if (identity) return identity;
+  identity = new Promise((resolve, reject) => {
+    const open = indexedDB.open('katka-installation', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('keys', 'readwrite');
+      const store = tx.objectStore('keys');
+      const read = store.get('installation');
+      let key;
+      read.onsuccess = () => {
+        key = read.result;
+        if (!key) {
+          key = Array.from(crypto.getRandomValues(new Uint8Array(32)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+          store.add(key, 'installation');
+        }
+      };
+      tx.oncomplete = () => { db.close(); resolve(key); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }).catch(() => {
+    identity = undefined;
+    throw new Error('Не удалось сохранить ключ установки в игровом браузере.');
+  });
+  return identity;
+}
+
+function render() {
+  element('pair').hidden = !known || Boolean(generation);
+  element('linked').hidden = !generation;
+  for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
+}
+
+async function api(action, data) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 8000);
+  try {
+    const key = await installationKey();
+    const gateway = document.querySelector('meta[name="katka-gateway"]').content || location.origin;
+    const response = await fetch(new URL('/v1/' + action, gateway), {
+      method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify(data), signal: abort.signal
+    });
+    const result = await response.json();
+    online = true;
+    element('server').textContent = 'Сервер на связи';
+    if (!response.ok) {
+      const error = new Error(result.error || 'Сервер отклонил запрос');
+      error.terminalDelivery = ['unknown', 'rejected', 'previous_binding'].includes(result.delivery);
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof SyntaxError || error.name === 'AbortError') {
+      online = false;
+      element('server').textContent = 'Нет связи с сервером';
+      throw new Error('Проверьте соединение. Панель подключится автоматически.');
+    }
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+async function refresh() {
+  const state = await api('status', {});
+  generation = state.generation;
+  known = true;
+}
+
+async function run(operation) {
+  if (busy) return;
+  busy = true;
+  render();
+  try { await operation(); }
+  catch (error) { element('message').textContent = error.message; }
+  finally { busy = false; render(); }
+}
+
+element('pair').onsubmit = event => {
+  event.preventDefault();
+  run(async () => {
+    const result = await api('bind', {code: element('code').value.trim().toUpperCase()});
+    generation = result.generation;
+    element('code').value = '';
+    element('message').textContent = '';
+  });
+};
+element('test').onclick = () => run(async () => {
+  await api('test', {generation});
+  element('message').textContent = 'Запрос на проверку принят';
+});
+element('unlink').onclick = () => run(async () => {
+  await api('unlink', {generation});
+  generation = null;
+  element('message').textContent = 'Telegram отключён';
+});
+
+async function commandLoop() {
+  let pending;
+  while (true) {
+    try {
+      const state = await api('status', {});
+      const current = state.generation;
+      if (!current || !/^[0-9a-f]{32}$/.test(current)) {
+        pending = undefined;
+        document.title = 'owner:none';
+      } else {
+        const acknowledged = pending && pending.generation === current &&
+          location.hash === '#ack=' + current + ':' + pending.id;
+        const result = await api('poll', {generation: current, ack: acknowledged ? pending.id : 0});
+        const command = result.command;
+        if (!command) {
+          pending = undefined;
+          document.title = 'owner:' + current;
+        } else if (Number.isSafeInteger(command.id) && command.id > 0 &&
+                   ['/play_normal', '/play_ranked', '/play_street', '/cancel', '/watch_black'].includes(command.action)) {
+          pending = {generation: current, id: command.id};
+          document.title = 'katka:' + current + ':' + command.id + ':' + command.action;
+        }
+      }
+    } catch {
+      // The durable queue retains a pending command while the bridge reconnects.
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+}
+
+async function reportMatch() {
+  const receipt = location.hash.slice(1);
+  const parts = /^([a-f0-9]{32}):([1-9][0-9]{0,19})$/.exec(receipt);
+  if (!parts) return;
+  while (location.hash.slice(1) === receipt) {
+    try {
+      const state = await api('status', {});
+      if (state.generation === parts[1]) {
+        await api('match', {generation: parts[1], match: parts[2]});
+      }
+      document.title = 'received:' + receipt;
+      return;
+    } catch (error) {
+      if (error.terminalDelivery) { document.title = 'received:' + receipt; return; }
+      await new Promise(resolve => setTimeout(resolve, 4000));
+    }
+  }
+}
+const view = new URLSearchParams(location.search).get('view');
+if (view === 'match') {
+  document.querySelector('main').hidden = true;
+  window.addEventListener('hashchange', reportMatch);
+  reportMatch();
+} else if (view === 'commands') {
+  document.querySelector('main').hidden = true;
+  commandLoop();
+} else {
+  run(refresh);
+  setInterval(() => run(refresh), 7000);
+}
+</script>
+</html>
