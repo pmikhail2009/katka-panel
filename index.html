@@ -178,34 +178,34 @@ element('unlink').onclick = () => run(async () => {
   element('message').textContent = 'Telegram отключён';
 });
 
-async function commandLoop() {
-  let pending;
-  while (true) {
+function commandLoop() {
+  let inFlight = false;
+  async function poll() {
+    const input = /^#poll=\d+:(?:([a-f0-9]{32}):([1-9][0-9]{0,14}))?$/.exec(location.hash);
+    if (!input || inFlight) return;
+    inFlight = true;
     try {
-      const state = await api('status', {});
-      const current = state.generation;
+      const result = await api('poll', {generation: input[1], ack: input[2] ? Number(input[2]) : 0});
+      const current = result.generation;
       if (!current || !/^[0-9a-f]{32}$/.test(current)) {
-        pending = undefined;
         document.title = 'owner:none';
       } else {
-        const acknowledged = pending && pending.generation === current &&
-          location.hash === '#ack=' + current + ':' + pending.id;
-        const result = await api('poll', {generation: current, ack: acknowledged ? pending.id : 0});
         const command = result.command;
         if (!command) {
-          pending = undefined;
           document.title = 'owner:' + current;
         } else if (Number.isSafeInteger(command.id) && command.id > 0 &&
+                   Number.isSafeInteger(command.expires) && command.expires > Date.now() &&
                    ['/play_normal', '/play_ranked', '/play_street', '/cancel', '/watch_black'].includes(command.action)) {
-          pending = {generation: current, id: command.id};
-          document.title = 'katka:' + current + ':' + command.id + ':' + command.action;
+          document.title = 'katka:' + current + ':' + command.id + ':' + command.action + ':' + command.expires;
         }
       }
     } catch {
       // The durable queue retains a pending command while the bridge reconnects.
-    }
-    await new Promise(resolve => setTimeout(resolve, 1500));
+      document.title = 'owner:none';
+    } finally { inFlight = false; }
   }
+  window.addEventListener('hashchange', poll);
+  poll();
 }
 
 async function reportMatch() {
