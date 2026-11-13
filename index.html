@@ -200,7 +200,33 @@ async function reportMatch() {
   }
 }
 const view = new URLSearchParams(location.search).get('view');
-if (view === 'match') {
+if (view === 'native') {
+  document.querySelector('main').hidden = true;
+  let lastRequest;
+  async function handleNative() {
+    const input = /^#(\d+):(status|bind|test|unlink):([A-F0-9]{0,16})$/.exec(location.hash);
+    if (!input || lastRequest === input[0]) return;
+    lastRequest = input[0];
+    const [, id, action, code] = input;
+    let state = 'offline', result = 'status';
+    try {
+      const current = await api('status', {});
+      state = current.generation ? 'linked' : 'unlinked';
+      if (action === 'bind') {
+        const binding = await api('bind', {code});
+        if (!binding.generation) throw new Error('Привязка не подтверждена');
+        state = 'linked'; result = 'bound';
+      } else if (action === 'test' || action === 'unlink') {
+        await api(action, {generation: current.generation});
+        if (action === 'unlink') state = 'unlinked';
+        result = action === 'test' ? 'tested' : 'unbound';
+      }
+    } catch { result = 'rejected'; if (!online) state = 'offline'; }
+    if (lastRequest === input[0]) document.title = ['native', id, state, result].join(':');
+  }
+  window.addEventListener('hashchange', handleNative);
+  handleNative();
+} else if (view === 'match') {
   document.querySelector('main').hidden = true;
   window.addEventListener('hashchange', reportMatch);
   reportMatch();
