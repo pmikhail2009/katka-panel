@@ -89,7 +89,8 @@ function render() {
 
 async function api(action, data) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), 8000);
+  const timer = setTimeout(() => abort.abort(), 20000);
+  let phase = 'storage';
   try {
     const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
     if (!configuredGateway && location.hostname.endsWith('.github.io')) {
@@ -99,11 +100,13 @@ async function api(action, data) {
     }
     const gateway = configuredGateway || location.origin;
     const key = await installationKey();
+    phase = 'network';
     const response = await fetch(new URL('/v1/' + action, gateway), {
       method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
       body: JSON.stringify(data), signal: abort.signal
     });
+    phase = 'response';
     const result = await response.json();
     online = true;
     element('server').textContent = 'Сервер на связи';
@@ -117,8 +120,11 @@ async function api(action, data) {
     if (error instanceof TypeError || error instanceof SyntaxError || error.name === 'AbortError') {
       online = false;
       element('server').textContent = 'Нет связи с сервером';
-      throw new Error('Проверьте соединение. Панель подключится автоматически.');
+      const failure = new Error('Проверьте соединение. Панель подключится автоматически.');
+      failure.connectionFailure = error.name === 'AbortError' ? 'timeout' : phase;
+      throw failure;
     }
+    if (!online) error.connectionFailure = phase;
     throw error;
   } finally { clearTimeout(timer); }
 }
@@ -239,7 +245,13 @@ if (view === 'native') {
           result = action === 'test' ? 'tested' : 'unbound';
         }
       }
-    } catch { result = 'rejected'; if (!online) state = 'offline'; }
+    } catch (error) {
+      result = 'rejected';
+      if (!online) {
+        state = 'offline';
+        result = 'connection_' + (error.connectionFailure || 'unknown');
+      }
+    }
     if (lastRequest === input[0]) document.title = ['native', id, state, result].join(':');
   }
   window.addEventListener('hashchange', handleNative);
