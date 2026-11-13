@@ -91,8 +91,14 @@ async function api(action, data) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), 8000);
   try {
+    const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
+    if (!configuredGateway && location.hostname.endsWith('.github.io')) {
+      online = false;
+      element('server').textContent = 'Игровой сервер ещё не подключён';
+      throw new Error('Игровой сервер ещё не подключён');
+    }
+    const gateway = configuredGateway || location.origin;
     const key = await installationKey();
-    const gateway = document.querySelector('meta[name="katka-gateway"]').content || location.origin;
     const response = await fetch(new URL('/v1/' + action, gateway), {
       method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
@@ -117,6 +123,17 @@ async function api(action, data) {
   } finally { clearTimeout(timer); }
 }
 
+async function bindInstallation(code) {
+  const deadline = Date.now() + 600000;
+  while (Date.now() < deadline) {
+    const result = await api('bind', {code});
+    if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) return result;
+    if (!result.pending) break;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  throw new Error('Привязка не подтверждена. Получите новый код в Telegram.');
+}
+
 async function refresh() {
   const state = await api('status', {});
   generation = state.generation;
@@ -135,7 +152,7 @@ async function run(operation) {
 element('pair').onsubmit = event => {
   event.preventDefault();
   run(async () => {
-    const result = await api('bind', {code: element('code').value.trim().toUpperCase()});
+    const result = await bindInstallation(element('code').value.trim().toUpperCase());
     generation = result.generation;
     element('code').value = '';
     element('message').textContent = '';
@@ -210,16 +227,17 @@ if (view === 'native') {
     const [, id, action, code] = input;
     let state = 'offline', result = 'status';
     try {
-      const current = await api('status', {});
-      state = current.generation ? 'linked' : 'unlinked';
       if (action === 'bind') {
-        const binding = await api('bind', {code});
-        if (!binding.generation) throw new Error('Привязка не подтверждена');
+        await bindInstallation(code);
         state = 'linked'; result = 'bound';
-      } else if (action === 'test' || action === 'unlink') {
-        await api(action, {generation: current.generation});
-        if (action === 'unlink') state = 'unlinked';
-        result = action === 'test' ? 'tested' : 'unbound';
+      } else {
+        const current = await api('status', {});
+        state = current.generation ? 'linked' : 'unlinked';
+        if (action === 'test' || action === 'unlink') {
+          await api(action, {generation: current.generation});
+          if (action === 'unlink') state = 'unlinked';
+          result = action === 'test' ? 'tested' : 'unbound';
+        }
       }
     } catch { result = 'rejected'; if (!online) state = 'offline'; }
     if (lastRequest === input[0]) document.title = ['native', id, state, result].join(':');
