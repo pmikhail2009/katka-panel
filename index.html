@@ -51,6 +51,8 @@ let known = false;
 let online = false;
 let identity;
 let lastPing = null;
+let accessTier = 'free';
+const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
 
 function installationKey() {
   if (identity) return identity;
@@ -187,6 +189,7 @@ function receiveCommand(current, command) {
 function render() {
   element('pair').hidden = !known || Boolean(generation);
   element('linked').hidden = !generation;
+  element('test').hidden = !fullAccess();
   for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
 }
 
@@ -212,6 +215,7 @@ async function api(action, data) {
     });
     phase = 'response';
     const result = await response.json();
+    if (action === 'status') accessTier = ['owner', 'test'].includes(result.tier) ? result.tier : 'free';
     if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
     online = true;
     element('server').textContent = 'Сервер на связи';
@@ -445,6 +449,7 @@ function queueStateLoop() {
 }
 
 function notificationMode(next) {
+  if (!fullAccess()) return 'auto';
   const key = 'katka_notifications';
   if (['on', 'off', 'auto'].includes(next)) localStorage.setItem(key, next);
   const saved = localStorage.getItem(key);
@@ -457,12 +462,12 @@ async function reportMatch() {
   if (!parts) return;
   while (location.hash.slice(1) === receipt) {
     try {
+      const state = await api('status', {});
       const mode = notificationMode();
       // Receipts without an origin come from older VPKs; retain their behavior.
       if (mode === 'off' || mode === 'auto' && parts[3] === 'manual') {
         document.title = 'received:' + receipt; return;
       }
-      const state = await api('status', {});
       if (state.generation === parts[1]) {
         await api('match', {generation: parts[1], match: parts[2]});
       }
@@ -487,16 +492,13 @@ if (view === 'native') {
     const started = performance.now() - Math.min(120000, Math.max(0, Date.now() - clicked));
     let state = 'offline', result = 'status';
     try {
-      if (action === 'notifications') {
-        notificationMode(code);
-        result = 'notifications';
-      }
       if (action === 'bind') {
         await bindInstallation(code);
         state = 'linked'; result = 'bound';
       } else {
         const current = await api('status', {});
         await observeGeneration(current.generation);
+        if (action === 'notifications') { notificationMode(code); result = 'notifications'; }
         state = current.generation ? 'linked' : 'unlinked';
         if (action === 'test' || action === 'unlink') {
           if (action === 'test') await testNotification(current.generation, started);
@@ -512,7 +514,7 @@ if (view === 'native') {
         result = 'connection_' + (error.connectionFailure || 'unknown');
       }
     }
-    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode()].join(':');
+    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode(), accessTier].join(':');
   }
   window.addEventListener('hashchange', handleNative);
   handleNative();
@@ -538,3 +540,4 @@ if (view === 'native') {
 }
 </script>
 </html>
+
