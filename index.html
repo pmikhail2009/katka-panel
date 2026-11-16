@@ -437,12 +437,24 @@ function queueStateLoop() {
   inspect();
 }
 
+function notificationMode(next) {
+  const key = 'katka_notifications';
+  if (['on', 'off', 'auto'].includes(next)) localStorage.setItem(key, next);
+  const saved = localStorage.getItem(key);
+  return ['on', 'off', 'auto'].includes(saved) ? saved : 'auto';
+}
+
 async function reportMatch() {
   const receipt = location.hash.slice(1);
-  const parts = /^([a-f0-9]{32}):([1-9][0-9]{0,19})$/.exec(receipt);
+  const parts = /^([a-f0-9]{32}):([1-9][0-9]{0,19})(?::(bot|manual))?$/.exec(receipt);
   if (!parts) return;
   while (location.hash.slice(1) === receipt) {
     try {
+      const mode = notificationMode();
+      // Receipts without an origin come from older VPKs; retain their behavior.
+      if (mode === 'off' || mode === 'auto' && parts[3] === 'manual') {
+        document.title = 'received:' + receipt; return;
+      }
       const state = await api('status', {});
       if (state.generation === parts[1]) {
         await api('match', {generation: parts[1], match: parts[2]});
@@ -460,12 +472,16 @@ if (view === 'native') {
   document.querySelector('main').hidden = true;
   let lastRequest;
   async function handleNative() {
-    const input = /^#(\d+):(status|bind|test|unlink):([A-F0-9]{0,16})$/.exec(location.hash);
+    const input = /^#(\d+):(status|bind|test|unlink|notifications):([A-F0-9]{0,16}|on|off|auto)$/.exec(location.hash);
     if (!input || lastRequest === input[0]) return;
     lastRequest = input[0];
     const [, id, action, code] = input;
     let state = 'offline', result = 'status';
     try {
+      if (action === 'notifications') {
+        notificationMode(code);
+        result = 'notifications';
+      }
       if (action === 'bind') {
         await bindInstallation(code);
         state = 'linked'; result = 'bound';
@@ -486,7 +502,7 @@ if (view === 'native') {
         result = 'connection_' + (error.connectionFailure || 'unknown');
       }
     }
-    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none'].join(':');
+    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode()].join(':');
   }
   window.addEventListener('hashchange', handleNative);
   handleNative();
