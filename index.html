@@ -275,9 +275,16 @@ element('pair').onsubmit = event => {
     element('message').textContent = '';
   });
 };
+async function testNotification(current, started = performance.now()) {
+  const result = await api('test', {generation: current});
+  const elapsed = Math.max(0, Math.round(performance.now() - started));
+  if (result.delivery !== 'delivered' || typeof result.test !== 'string')
+    throw new Error('Telegram не подтвердил проверочное уведомление');
+  await api('test', {generation: current, test: result.test, elapsed});
+}
 element('test').onclick = () => run(async () => {
-  await api('test', {generation});
-  element('message').textContent = 'Запрос на проверку принят';
+  await testNotification(generation);
+  element('message').textContent = 'Проверочное уведомление отправлено, задержка указана в Telegram';
 });
 element('unlink').onclick = () => run(async () => {
   await api('unlink', {generation});
@@ -476,6 +483,8 @@ if (view === 'native') {
     if (!input || lastRequest === input[0]) return;
     lastRequest = input[0];
     const [, id, action, code] = input;
+    const clicked = action === 'test' && /^\d{13}$/.test(code) ? Number(code) : Date.now();
+    const started = performance.now() - Math.min(120000, Math.max(0, Date.now() - clicked));
     let state = 'offline', result = 'status';
     try {
       if (action === 'notifications') {
@@ -490,13 +499,14 @@ if (view === 'native') {
         await observeGeneration(current.generation);
         state = current.generation ? 'linked' : 'unlinked';
         if (action === 'test' || action === 'unlink') {
-          await api(action, {generation: current.generation});
+          if (action === 'test') await testNotification(current.generation, started);
+          else await api(action, {generation: current.generation});
           if (action === 'unlink') { await resetCommands(); state = 'unlinked'; }
           result = action === 'test' ? 'tested' : 'unbound';
         }
       }
     } catch (error) {
-      result = 'rejected';
+      result = action === 'test' ? 'test_failed' : 'rejected';
       if (!online) {
         state = 'offline';
         result = 'connection_' + (error.connectionFailure || 'unknown');
