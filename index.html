@@ -215,6 +215,7 @@ async function api(action, data) {
     });
     phase = 'response';
     const result = await response.json();
+    if (result.settings && ['on','off','auto'].includes(result.settings.mode)) localStorage.setItem('katka_notifications',result.settings.mode);
     if (action === 'status') accessTier = ['owner', 'test'].includes(result.tier) ? result.tier : 'free';
     if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
     online = true;
@@ -284,7 +285,8 @@ async function testNotification(current, started = performance.now()) {
   const elapsed = Math.max(0, Math.round(performance.now() - started));
   if (result.delivery !== 'delivered' || typeof result.test !== 'string')
     throw new Error('Telegram не подтвердил проверочное уведомление');
-  await api('test', {generation: current, test: result.test, elapsed});
+  // The server already published a complete result; the game measurement is optional.
+  try { await api('test', {generation: current, test: result.test, elapsed}); } catch {}
 }
 element('test').onclick = () => run(async () => {
   await testNotification(generation);
@@ -416,7 +418,17 @@ function rosterLoop() {
 }
 
 function queueStateLoop() {
-  let inFlight = false, pendingHash = false;
+  let inFlight = false, pendingHash = false, lastTelemetry = 0, lastState = '', telemetryBusy = false;
+  async function publishState(input) {
+    if (telemetryBusy || input[2] === lastState && Date.now()-lastTelemetry < 10000) return;
+    telemetryBusy=true;
+    try {
+    const current = await api('status', {});
+    if (!current.generation) return;
+    await api('telemetry',{generation:current.generation,telemetry:{state:input[2],observed:Number(input[1])}});
+    lastState=input[2]; lastTelemetry=Date.now();
+    } finally { telemetryBusy=false; }
+  }
   async function inspect() {
     const hash = location.hash;
     const input = /^#(\d+):(waiting|idle|party|connecting|unknown)$/.exec(hash);
@@ -435,6 +447,7 @@ function queueStateLoop() {
         else if (input[2] === 'idle' && item.action === '/cancel')
           saveOutcome(state,item.generation,item.id,'cancelled');
       });
+      publishState(input).catch(() => {});
       document.title = 'state:' + input[1];
     } catch { document.title = 'state:error:' + input[1]; }
     finally {
@@ -465,11 +478,9 @@ async function reportMatch() {
       const state = await api('status', {});
       const mode = notificationMode();
       // Receipts without an origin come from older VPKs; retain their behavior.
-      if (mode === 'off' || mode === 'auto' && parts[3] === 'manual') {
-        document.title = 'received:' + receipt; return;
-      }
+      // Report all matches: the server updates the search card and applies preferences.
       if (state.generation === parts[1]) {
-        await api('match', {generation: parts[1], match: parts[2]});
+        await api('match', {generation: parts[1], match: parts[2],origin:parts[3]});
       }
       document.title = 'received:' + receipt;
       return;
@@ -498,7 +509,10 @@ if (view === 'native') {
       } else {
         const current = await api('status', {});
         await observeGeneration(current.generation);
-        if (action === 'notifications') { notificationMode(code); result = 'notifications'; }
+        if (action === 'notifications') {
+          await api('settings',{generation:current.generation,telemetry:{mode:code}});
+          notificationMode(code); result = 'notifications';
+        }
         state = current.generation ? 'linked' : 'unlinked';
         if (action === 'test' || action === 'unlink') {
           if (action === 'test') await testNotification(current.generation, started);
@@ -540,4 +554,3 @@ if (view === 'native') {
 }
 </script>
 </html>
-
