@@ -11,10 +11,22 @@ html, body { margin: 0; background: #20221e; color: #f3e6c7; font: 17px/1.4 "Seg
 main { border: 1px solid #8e876b; border-top: 4px solid #d3b275; padding: 20px 24px 22px }
 h1 { margin: 0; font: bold 25px/1.15 Georgia, serif }
 .heading { display: flex; align-items: center; justify-content: space-between; gap: 10px }
+.language-control { position: relative; flex: none }
 #language { display: grid; place-items: center; min-height: 28px; width: 36px; flex: none; padding: 0 }
+#language-picker { position: absolute; z-index: 1; top: calc(100% + 4px); right: 0; width: 156px; padding: 5px; background: #282a24; border: 1px solid #96815c }
+#language-picker button { display: block; text-align: left; width: 100%; min-height: 32px; padding: 3px 8px; font-size: 16px }
+#language-picker button + button { margin-top: 3px }
 #flag { position: relative; width: 26px; height: 16px; background: linear-gradient(#fff 0 33.33%, #0039a6 33.33% 66.66%, #d52b1e 66.66%) }
-[lang="en"] #flag { background: repeating-linear-gradient(#b22234 0 7.69%, #fff 7.69% 15.38%) }
-[lang="en"] #flag::before { content: "✦✦✦"; position: absolute; inset: 0 auto auto 0; width: 12px; height: 9px; background: #3c3b6e; color: #fff; font: 5px/9px sans-serif; text-align: center }
+[lang="en"] #flag {
+  background:
+    linear-gradient(90deg, transparent 44%, #c8102e 44% 56%, transparent 56%),
+    linear-gradient(transparent 41%, #c8102e 41% 59%, transparent 59%),
+    linear-gradient(90deg, transparent 38%, #fff 38% 62%, transparent 62%),
+    linear-gradient(transparent 31%, #fff 31% 69%, transparent 69%),
+    linear-gradient(32deg, transparent 42%, #fff 42% 48%, #c8102e 48% 52%, #fff 52% 58%, transparent 58%),
+    linear-gradient(-32deg, transparent 42%, #fff 42% 48%, #c8102e 48% 52%, #fff 52% 58%, transparent 58%),
+    #012169
+}
 #server { margin: 8px 0 18px; color: #c5c4ae }
 label { display: block; margin-bottom: 6px }
 .row { display: flex; gap: 8px; flex-wrap: wrap }
@@ -31,7 +43,13 @@ button:disabled { opacity: .55; cursor: default }
 <main>
   <div class="heading">
     <h1 id="heading">Telelock — match alerts</h1>
-    <button type="button" class="secondary" id="language" aria-label="Switch to Russian"><span id="flag" aria-hidden="true"></span></button>
+    <div class="language-control">
+      <button type="button" class="secondary" id="language" aria-label="Language" aria-expanded="false" aria-controls="language-picker"><span id="flag" aria-hidden="true"></span></button>
+      <div id="language-picker" hidden>
+        <button type="button" class="secondary" id="language-en" lang="en" aria-pressed="true">✓ English</button>
+        <button type="button" class="secondary" id="language-ru" lang="ru" aria-pressed="false">Русский</button>
+      </div>
+    </div>
   </div>
   <p id="server" role="status">Connecting to the server…</p>
   <form id="pair" hidden>
@@ -63,6 +81,8 @@ let accessTier = 'free';
 const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
 
 let language = 'en';
+let languagePickerOpen = false;
+const languageNames = { en: 'English', ru: 'Русский' };
 try { if (localStorage.getItem('katka_language') === 'ru') language = 'ru'; } catch {}
 function applyLanguage(next) {
   if (next !== 'en' && next !== 'ru') return;
@@ -225,9 +245,16 @@ function render() {
   };
   for (const [id, label] of Object.entries(labels)) element(id).textContent = label;
   const languageButton = element('language');
-  languageButton.title = t('Switch to Russian', 'Переключить на английский');
+  languageButton.title = t('Language', 'Язык');
   languageButton.setAttribute('aria-label', languageButton.title);
+  languageButton.setAttribute('aria-expanded', String(languagePickerOpen));
   languageButton.disabled = !online || busy;
+  element('language-picker').hidden = !languagePickerOpen;
+  for (const [choice, name] of Object.entries(languageNames)) {
+    const option = element('language-' + choice);
+    option.textContent = (choice === language ? '✓ ' : '') + name;
+    option.setAttribute('aria-pressed', String(choice === language));
+  }
   element('pair').hidden = !known || Boolean(generation);
   element('linked').hidden = !generation;
   element('test').hidden = !fullAccess();
@@ -340,10 +367,22 @@ element('unlink').onclick = () => run(async () => {
   generation = null;
   element('message').textContent = t('Telegram disconnected', 'Telegram отключён');
 });
-element('language').onclick = () => run(async () => {
-  await changePanelLanguage(t('ru', 'en'), generation);
-  element('message').textContent = '';
-});
+element('language').onclick = () => {
+  languagePickerOpen = !languagePickerOpen;
+  render();
+  if (languagePickerOpen) element('language-' + language).focus();
+};
+for (const choice of Object.keys(languageNames)) {
+  element('language-' + choice).onclick = () => {
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+    if (choice !== language) run(async () => {
+      await changePanelLanguage(choice, generation);
+      element('message').textContent = '';
+    });
+  };
+}
 
 function commandLoop() {
   let inFlight = false, pendingHash = false;
@@ -602,6 +641,12 @@ if (view === 'native') {
   document.querySelector('main').hidden = true;
   queueStateLoop();
 } else {
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !languagePickerOpen) return;
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+  });
   run(refresh);
   setInterval(() => run(refresh), 7000);
 }
