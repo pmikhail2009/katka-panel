@@ -1,15 +1,20 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta name="katka-gateway" content="https://katka-game-gateway.pmikhail2009.workers.dev">
-<title>KATKA</title>
+<title>Telelock</title>
 <style>
 * { box-sizing: border-box }
 html, body { margin: 0; background: #20221e; color: #f3e6c7; font: 17px/1.4 "Segoe UI", sans-serif }
 main { border: 1px solid #8e876b; border-top: 4px solid #d3b275; padding: 20px 24px 22px }
 h1 { margin: 0; font: bold 25px/1.15 Georgia, serif }
+.heading { display: flex; align-items: center; justify-content: space-between; gap: 10px }
+#language { display: grid; place-items: center; min-height: 28px; width: 36px; flex: none; padding: 0 }
+#flag { position: relative; width: 26px; height: 16px; background: linear-gradient(#fff 0 33.33%, #0039a6 33.33% 66.66%, #d52b1e 66.66%) }
+[lang="en"] #flag { background: repeating-linear-gradient(#b22234 0 7.69%, #fff 7.69% 15.38%) }
+[lang="en"] #flag::before { content: "✦✦✦"; position: absolute; inset: 0 auto auto 0; width: 12px; height: 9px; background: #3c3b6e; color: #fff; font: 5px/9px sans-serif; text-align: center }
 #server { margin: 8px 0 18px; color: #c5c4ae }
 label { display: block; margin-bottom: 6px }
 .row { display: flex; gap: 8px; flex-wrap: wrap }
@@ -24,20 +29,23 @@ button:disabled { opacity: .55; cursor: default }
 #message:empty { display: none }
 </style>
 <main>
-  <h1>KATKA — уведомления о матче</h1>
-  <p id="server" role="status">Проверяем соединение…</p>
+  <div class="heading">
+    <h1 id="heading">Telelock — match alerts</h1>
+    <button type="button" class="secondary" id="language" aria-label="Switch to Russian"><span id="flag" aria-hidden="true"></span></button>
+  </div>
+  <p id="server" role="status">Connecting to the server…</p>
   <form id="pair" hidden>
-    <label for="code">Код из Telegram</label>
+    <label for="code" id="code-label">Telegram code</label>
     <div class="row">
       <input id="code" type="text" maxlength="16" minlength="16" pattern="[0-9A-Fa-f]{16}" required autocomplete="off" spellcheck="false">
-      <button id="bind">Подключить</button>
+      <button id="bind">Connect</button>
     </div>
   </form>
   <section id="linked" hidden>
-    <p id="status">Telegram подключён</p>
+    <p id="status">Telegram connected</p>
     <div class="row">
-      <button type="button" id="test">Проверить уведомление</button>
-      <button type="button" class="secondary" id="unlink">Отключить Telegram</button>
+      <button type="button" id="test">Send a test notification</button>
+      <button type="button" class="secondary" id="unlink">Disconnect Telegram</button>
     </div>
   </section>
   <p id="message" role="status" aria-live="polite"></p>
@@ -53,6 +61,23 @@ let identity;
 let lastPing = null;
 let accessTier = 'free';
 const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
+
+let language = 'en';
+try { if (localStorage.getItem('katka_language') === 'ru') language = 'ru'; } catch {}
+function applyLanguage(next) {
+  if (next !== 'en' && next !== 'ru') return;
+  language = next;
+  try { localStorage.setItem('katka_language', next); } catch {}
+}
+const t = (en, ru) => language === 'ru' ? ru : en;
+
+async function changePanelLanguage(next, current) {
+  if (current) {
+    const result = await api('language', { generation: current, language: next });
+    if (result.language !== next) throw new Error(t('Could not change the language.', 'Не удалось изменить язык.'));
+  }
+  applyLanguage(next);
+}
 
 function installationKey() {
   if (identity) return identity;
@@ -79,7 +104,7 @@ function installationKey() {
     };
   }).catch(() => {
     identity = undefined;
-    throw new Error('Не удалось сохранить ключ установки в игровом браузере.');
+    throw new Error(t('Could not save the installation key in the game browser.', 'Не удалось сохранить ключ установки в игровом браузере.'));
   });
   return identity;
 }
@@ -187,6 +212,22 @@ function receiveCommand(current, command) {
 }
 
 function render() {
+  document.documentElement.lang = language;
+  const labels = {
+    heading: t('Telelock — match alerts', 'Telelock — уведомления о матче'),
+    server: online ? t('Server online', 'Сервер на связи') : known
+      ? t('Server unreachable', 'Нет связи с сервером') : t('Connecting to the server…', 'Подключаемся к серверу…'),
+    'code-label': t('Telegram code', 'Код из Telegram'),
+    bind: t('Connect', 'Подключить'),
+    status: t('Telegram connected', 'Telegram подключён'),
+    test: t('Send a test notification', 'Проверить уведомление'),
+    unlink: t('Disconnect Telegram', 'Отключить Telegram'),
+  };
+  for (const [id, label] of Object.entries(labels)) element(id).textContent = label;
+  const languageButton = element('language');
+  languageButton.title = t('Switch to Russian', 'Переключить на английский');
+  languageButton.setAttribute('aria-label', languageButton.title);
+  languageButton.disabled = !online || busy;
   element('pair').hidden = !known || Boolean(generation);
   element('linked').hidden = !generation;
   element('test').hidden = !fullAccess();
@@ -201,8 +242,7 @@ async function api(action, data) {
     const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
     if (!configuredGateway && location.hostname.endsWith('.github.io')) {
       online = false;
-      element('server').textContent = 'Игровой сервер ещё не подключён';
-      throw new Error('Игровой сервер ещё не подключён');
+      throw new Error(t('The game server is not configured yet.', 'Игровой сервер ещё не подключён'));
     }
     const gateway = configuredGateway || location.origin;
     const key = await installationKey();
@@ -219,9 +259,8 @@ async function api(action, data) {
     if (action === 'status') accessTier = ['owner', 'test'].includes(result.tier) ? result.tier : 'free';
     if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
     online = true;
-    element('server').textContent = 'Сервер на связи';
     if (!response.ok) {
-      const error = new Error(result.error || 'Сервер отклонил запрос');
+      const error = new Error(result.error || t('The server rejected the request.', 'Сервер отклонил запрос'));
       error.httpStatus = response.status;
       error.terminalDelivery = ['unknown', 'rejected', 'previous_binding'].includes(result.delivery);
       throw error;
@@ -231,8 +270,8 @@ async function api(action, data) {
     if (error instanceof TypeError || error instanceof SyntaxError || error.name === 'AbortError') {
       online = false;
       lastPing = null;
-      element('server').textContent = 'Нет связи с сервером';
-      const failure = new Error('Проверьте соединение. Панель подключится автоматически.');
+      const failure = new Error(t('Check the connection. Telelock will reconnect automatically.',
+        'Проверьте соединение. Панель подключится автоматически.'));
       failure.connectionFailure = error.name === 'AbortError' ? 'timeout' : phase;
       throw failure;
     }
@@ -252,12 +291,14 @@ async function bindInstallation(code) {
     if (!result.pending) break;
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
-  throw new Error('Привязка не подтверждена. Получите новый код в Telegram.');
+  throw new Error(t('Pairing could not be confirmed. Get a new code in Telegram.',
+    'Привязка не подтверждена. Получите новый код в Telegram.'));
 }
 
 async function refresh() {
   const state = await api('status', {});
   generation = state.generation;
+  applyLanguage(state.language);
   await observeGeneration(generation);
   known = true;
 }
@@ -278,25 +319,30 @@ element('pair').onsubmit = event => {
     generation = result.generation;
     element('code').value = '';
     element('message').textContent = '';
+    try { await refresh(); } catch { /* The next refresh can load account settings. */ }
   });
 };
 async function testNotification(current, started = performance.now()) {
   const result = await api('test', {generation: current});
   const elapsed = Math.max(0, Math.round(performance.now() - started));
   if (result.delivery !== 'delivered' || typeof result.test !== 'string')
-    throw new Error('Telegram не подтвердил проверочное уведомление');
+    throw new Error(t('Telegram did not confirm the test notification.', 'Telegram не подтвердил проверочное уведомление'));
   // The server already published a complete result; the game measurement is optional.
   try { await api('test', {generation: current, test: result.test, elapsed}); } catch {}
 }
 element('test').onclick = () => run(async () => {
   await testNotification(generation);
-  element('message').textContent = 'Проверочное уведомление отправлено, задержка указана в Telegram';
+  element('message').textContent = t('Test sent. Check Telegram for the timing.', 'Проверочное уведомление отправлено, задержка указана в Telegram');
 });
 element('unlink').onclick = () => run(async () => {
   await api('unlink', {generation});
   await resetCommands();
   generation = null;
-  element('message').textContent = 'Telegram отключён';
+  element('message').textContent = t('Telegram disconnected', 'Telegram отключён');
+});
+element('language').onclick = () => run(async () => {
+  await changePanelLanguage(t('ru', 'en'), generation);
+  element('message').textContent = '';
 });
 
 function commandLoop() {
@@ -495,7 +541,7 @@ if (view === 'native') {
   document.querySelector('main').hidden = true;
   let lastRequest;
   async function handleNative() {
-    const input = /^#(\d+):(status|bind|test|unlink|notifications):([A-F0-9]{0,16}|on|off|auto)$/.exec(location.hash);
+    const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru)$/.exec(location.hash);
     if (!input || lastRequest === input[0]) return;
     lastRequest = input[0];
     const [, id, action, code] = input;
@@ -506,14 +552,20 @@ if (view === 'native') {
       if (action === 'bind') {
         await bindInstallation(code);
         state = 'linked'; result = 'bound';
+        try { applyLanguage((await api('status', {})).language); } catch {}
       } else {
         const current = await api('status', {});
+        state = current.generation ? 'linked' : 'unlinked';
+        if (lastRequest === input[0]) applyLanguage(current.language);
         await observeGeneration(current.generation);
         if (action === 'notifications') {
           await api('settings',{generation:current.generation,telemetry:{mode:code}});
           notificationMode(code); result = 'notifications';
         }
-        state = current.generation ? 'linked' : 'unlinked';
+        if (action === 'language' && lastRequest === input[0]) {
+          await changePanelLanguage(code, current.generation);
+          result = 'language';
+        }
         if (action === 'test' || action === 'unlink') {
           if (action === 'test') await testNotification(current.generation, started);
           else await api(action, {generation: current.generation});
@@ -522,13 +574,14 @@ if (view === 'native') {
         }
       }
     } catch (error) {
-      result = action === 'test' ? 'test_failed' : 'rejected';
+      result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
+      if (state === 'offline' && online && action === 'bind') state = 'unlinked';
       if (!online) {
         state = 'offline';
         result = 'connection_' + (error.connectionFailure || 'unknown');
       }
     }
-    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode(), accessTier].join(':');
+    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode(), accessTier, language].join(':');
   }
   window.addEventListener('hashchange', handleNative);
   handleNative();
