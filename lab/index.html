@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="katka-gateway" content="https://katka-game-gateway.pmikhail2009.workers.dev">
+<title>Telelock</title>
+<style>
+* { box-sizing: border-box }
+html, body { margin: 0; background: #20221e; color: #f3e6c7; font: 17px/1.4 "Segoe UI", sans-serif }
+main { border: 1px solid #8e876b; border-top: 4px solid #d3b275; padding: 20px 24px 22px }
+h1 { margin: 0; font: bold 25px/1.15 Georgia, serif }
+.heading { display: flex; align-items: center; justify-content: space-between; gap: 10px }
+.language-control { position: relative; flex: none }
+#language { display: grid; place-items: center; min-height: 28px; width: 36px; flex: none; padding: 0 }
+#language-picker { position: absolute; z-index: 1; top: calc(100% + 4px); right: 0; width: 156px; padding: 5px; background: #282a24; border: 1px solid #96815c }
+#language-picker button { display: block; text-align: left; width: 100%; min-height: 32px; padding: 3px 8px; font-size: 16px }
+#language-picker button + button { margin-top: 3px }
+#flag { position: relative; width: 26px; height: 16px; background: linear-gradient(#fff 0 33.33%, #0039a6 33.33% 66.66%, #d52b1e 66.66%) }
+[lang="en"] #flag {
+  background:
+    linear-gradient(90deg, transparent 44%, #c8102e 44% 56%, transparent 56%),
+    linear-gradient(transparent 41%, #c8102e 41% 59%, transparent 59%),
+    linear-gradient(90deg, transparent 38%, #fff 38% 62%, transparent 62%),
+    linear-gradient(transparent 31%, #fff 31% 69%, transparent 69%),
+    linear-gradient(32deg, transparent 42%, #fff 42% 48%, #c8102e 48% 52%, #fff 52% 58%, transparent 58%),
+    linear-gradient(-32deg, transparent 42%, #fff 42% 48%, #c8102e 48% 52%, #fff 52% 58%, transparent 58%),
+    #012169
+}
+#server { margin: 8px 0 18px; color: #c5c4ae }
+label { display: block; margin-bottom: 6px }
+.row { display: flex; gap: 8px; flex-wrap: wrap }
+input, button { min-height: 40px; border: 1px solid #706e5b; border-radius: 3px; font: inherit }
+input { background: #141712; color: #f3e6c7; width: 13em; padding: 6px 10px; font-family: Consolas, monospace; text-transform: uppercase }
+button { cursor: pointer; color: #20221e; background: #d7bf88; padding: 6px 12px; font-weight: 600 }
+button.secondary { color: #e5dbc0; background: #34362e }
+button:disabled { opacity: .55; cursor: default }
+:focus-visible { outline: 2px solid #fff4cb; outline-offset: 2px }
+#status { margin: 0 0 10px; color: #acd8ad }
+#message { margin: 10px 0 0; color: #efcf9f }
+#message:empty { display: none }
+</style>
+<main>
+  <div class="heading">
+    <h1 id="heading">Telelock — match alerts</h1>
+    <div class="language-control">
+      <button type="button" class="secondary" id="language" aria-label="Language" aria-expanded="false" aria-controls="language-picker"><span id="flag" aria-hidden="true"></span></button>
+      <div id="language-picker" hidden>
+        <button type="button" class="secondary" id="language-en" lang="en" aria-pressed="true">✓ English</button>
+        <button type="button" class="secondary" id="language-ru" lang="ru" aria-pressed="false">Русский</button>
+      </div>
+    </div>
+  </div>
+  <p id="server" role="status">Connecting to the server…</p>
+  <form id="pair" hidden>
+    <label for="code" id="code-label">Telegram code</label>
+    <div class="row">
+      <input id="code" type="text" maxlength="16" minlength="16" pattern="[0-9A-Fa-f]{16}" required autocomplete="off" spellcheck="false">
+      <button id="bind">Connect</button>
+    </div>
+  </form>
+  <section id="linked" hidden>
+    <p id="status">Telegram connected</p>
+    <div class="row">
+      <button type="button" id="test">Send a test notification</button>
+      <button type="button" class="secondary" id="unlink">Disconnect Telegram</button>
+    </div>
+  </section>
+  <p id="message" role="status" aria-live="polite"></p>
+</main>
+<script>
+'use strict';
+const element = id => document.getElementById(id);
+let generation = null;
+let busy = false;
+let known = false;
+let online = false;
+let identity;
+let lastPing = null;
+const labPanel = new URLSearchParams(location.search).get('lab') === '1';
+const labStrategies = ['baseline', 'cached', 'lean'];
+let accessTier = 'free';
+const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
+
+let language = 'en';
+let languagePickerOpen = false;
+const languageNames = { en: 'English', ru: 'Русский' };
+try { if (localStorage.getItem('katka_language') === 'ru') language = 'ru'; } catch {}
+function applyLanguage(next) {
+  if (next !== 'en' && next !== 'ru') return;
+  language = next;
+  try { localStorage.setItem('katka_language', next); } catch {}
+}
+const t = (en, ru) => language === 'ru' ? ru : en;
+
+async function changePanelLanguage(next, current) {
+  if (current) {
+    const result = await api('language', { generation: current, language: next });
+    if (result.language !== next) throw new Error(t('Could not change the language.', 'Не удалось изменить язык.'));
+  }
+  applyLanguage(next);
+}
+
+function installationKey() {
+  if (identity) return identity;
+  identity = new Promise((resolve, reject) => {
+    const open = indexedDB.open('katka-installation', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('keys', 'readwrite');
+      const store = tx.objectStore('keys');
+      const read = store.get('installation');
+      let key;
+      read.onsuccess = () => {
+        key = read.result;
+        if (!key) {
+          key = Array.from(crypto.getRandomValues(new Uint8Array(32)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+          store.add(key, 'installation');
+        }
+      };
+      tx.oncomplete = () => { db.close(); resolve(key); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }).catch(() => {
+    identity = undefined;
+    throw new Error(t('Could not save the installation key in the game browser.', 'Не удалось сохранить ключ установки в игровом браузере.'));
+  });
+  return identity;
+}
+
+// These records belong to the installation, not to a particular Panorama window.
+// All mutations run inside one synchronous IndexedDB transaction callback.
+const commandKeys = ['katka_active_command', 'katka_last_received', 'katka_result_outbox'];
+function commandStore(change) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('katka-installation', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result, tx = db.transaction('keys', 'readwrite');
+      const store = tx.objectStore('keys'), values = {};
+      let remaining = commandKeys.length, answer;
+      for (const key of commandKeys) {
+        const read = store.get(key);
+        read.onsuccess = () => {
+          values[key] = read.result;
+          if (--remaining) return;
+          try {
+            const state = {active: values[commandKeys[0]], receipt: values[commandKeys[1]], outbox: values[commandKeys[2]] || []};
+            answer = change(state);
+            [state.active, state.receipt, state.outbox].forEach((value, i) => {
+              if (value === undefined || value === null) store.delete(commandKeys[i]);
+              else store.put(value, commandKeys[i]);
+            });
+          } catch (error) { tx.abort(); reject(error); }
+        };
+      }
+      tx.oncomplete = () => { db.close(); resolve(answer); };
+      tx.onabort = () => { db.close(); reject(tx.error || new Error('Не удалось сохранить состояние команды')); };
+    };
+  });
+}
+function resetCommands() {
+  return commandStore(state => { state.active = undefined; state.receipt = undefined; state.outbox = []; });
+}
+function observeGeneration(current) {
+  return commandStore(state => {
+    if (!current || state.receipt && state.receipt.generation !== current || state.active && state.active.generation !== current) {
+      state.active = undefined; state.receipt = undefined;
+    }
+    state.outbox = state.outbox.filter(item => item.generation === current);
+  });
+}
+function saveOutcome(state, generation, command, status) {
+  const previous = state.outbox.find(item => item.generation === generation && item.command === command);
+  if (previous) return previous;
+  if (state.active && state.active.generation === generation && state.active.id === command) {
+    if (state.active.outcome) return null;
+    state.active.outcome = status;
+    state.active.phase = 'finished';
+  }
+  const item = {generation, command, status, created: Date.now(), delivered: false, lease: 0};
+  state.outbox.push(item);
+  // Delivered receipts remain long enough to deduplicate late local messages.
+  state.outbox = state.outbox.filter(entry => !entry.delivered || entry.created + 86400000 > Date.now());
+  return item;
+}
+async function settleCommands() {
+  await commandStore(state => {
+    const active = state.active;
+    if (active && !active.outcome && active.expires <= Date.now())
+      saveOutcome(state, active.generation, active.id, 'unconfirmed');
+  });
+}
+async function flushResults() {
+  const item = await commandStore(state => {
+    const next = state.outbox.find(entry => !entry.delivered && (entry.lease || 0) <= Date.now());
+    if (!next) return null;
+    next.lease = Date.now() + 25000;
+    return {...next};
+  });
+  if (!item) return;
+  let terminal = false;
+  try {
+    await api('result', {generation: item.generation, command: item.command, status: item.status});
+    terminal = true;
+  } catch (error) { terminal = [400, 404, 409].includes(error.httpStatus); }
+  await commandStore(state => {
+    const saved = state.outbox.find(entry => entry.generation === item.generation && entry.command === item.command);
+    if (saved) { saved.delivered = terminal; saved.lease = terminal ? 0 : Date.now() + 1500; }
+  });
+}
+function isPlay(action) { return ['/play_normal', '/play_ranked', '/play_street'].includes(action); }
+function validCommand(command) {
+  return command && Number.isSafeInteger(command.id) && command.id > 0 && command.id < 1e15 &&
+    Number.isSafeInteger(command.expires) && command.expires > Date.now() &&
+    (isPlay(command.action) || ['/cancel', '/watch_black'].includes(command.action));
+}
+function receiveCommand(current, command) {
+  return commandStore(state => {
+    if (state.receipt && state.receipt.generation === current && state.receipt.id === command.id) return false;
+    state.receipt = {generation: current, id: command.id};
+    if (command.action !== '/watch_black') {
+      if (state.active && !state.active.outcome)
+        saveOutcome(state, state.active.generation, state.active.id, 'unconfirmed');
+      state.active = {generation: current, id: command.id, action: command.action,
+        receivedAt: Date.now(), expires: Math.min(command.expires, Date.now() + 15000), phase: 'received'};
+    }
+    return true;
+  });
+}
+
+function render() {
+  document.documentElement.lang = language;
+  const labels = {
+    heading: t('Telelock — match alerts', 'Telelock — уведомления о матче'),
+    server: online ? t('Server online', 'Сервер на связи') : known
+      ? t('Server unreachable', 'Нет связи с сервером') : t('Connecting to the server…', 'Подключаемся к серверу…'),
+    'code-label': t('Telegram code', 'Код из Telegram'),
+    bind: t('Connect', 'Подключить'),
+    status: t('Telegram connected', 'Telegram подключён'),
+    test: t('Send a test notification', 'Проверить уведомление'),
+    unlink: t('Disconnect Telegram', 'Отключить Telegram'),
+  };
+  for (const [id, label] of Object.entries(labels)) element(id).textContent = label;
+  const languageButton = element('language');
+  languageButton.title = t('Language', 'Язык');
+  languageButton.setAttribute('aria-label', languageButton.title);
+  languageButton.setAttribute('aria-expanded', String(languagePickerOpen));
+  languageButton.disabled = !online || busy;
+  element('language-picker').hidden = !languagePickerOpen;
+  for (const [choice, name] of Object.entries(languageNames)) {
+    const option = element('language-' + choice);
+    option.textContent = (choice === language ? '✓ ' : '') + name;
+    option.setAttribute('aria-pressed', String(choice === language));
+  }
+  element('pair').hidden = !known || Boolean(generation);
+  element('linked').hidden = !generation;
+  element('test').hidden = !fullAccess();
+  for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
+}
+
+async function api(action, data, timing) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), action === 'language' ? 40000 : 20000);
+  let phase = 'storage';
+  try {
+    const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
+    if (!configuredGateway && location.hostname.endsWith('.github.io')) {
+      online = false;
+      throw new Error(t('The game server is not configured yet.', 'Игровой сервер ещё не подключён'));
+    }
+    const gateway = configuredGateway || location.origin;
+    const key = await installationKey();
+    phase = 'network';
+    const started = performance.now();
+    const endpoint = new URL('/v1/' + action, gateway);
+    if (timing) endpoint.searchParams.set('lab', timing.strategy);
+    const response = await fetch(endpoint, {
+      method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify(data), signal: abort.signal
+    });
+    phase = 'response';
+    const result = await response.json();
+    const readAt = performance.now();
+    if (timing) {
+      const entry = performance.getEntriesByName(endpoint.href, 'resource')
+        .filter(item => item.startTime >= started && item.responseEnd > 0 && item.responseEnd <= readAt).pop();
+      const gatewayTime = entry?.serverTiming?.find(item => item.name === 'gateway')?.duration;
+      timing.http = entry ? Math.round(entry.duration) : 'none';
+      timing.gateway = Number.isFinite(gatewayTime) ? Math.round(gatewayTime) : 'none';
+      timing.browser = entry ? Math.round(readAt - entry.responseEnd) : 'none';
+    }
+    if (result.settings && ['on','off','auto'].includes(result.settings.mode)) localStorage.setItem('katka_notifications',result.settings.mode);
+    if (action === 'status') accessTier = ['owner', 'test'].includes(result.tier) ? result.tier : 'free';
+    if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
+    online = true;
+    if (!response.ok) {
+      const error = new Error(result.error || t('The server rejected the request.', 'Сервер отклонил запрос'));
+      error.httpStatus = response.status;
+      error.terminalDelivery = ['unknown', 'rejected', 'previous_binding'].includes(result.delivery);
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof SyntaxError || error.name === 'AbortError') {
+      online = false;
+      lastPing = null;
+      const failure = new Error(t('Check the connection. Telelock will reconnect automatically.',
+        'Проверьте соединение. Панель подключится автоматически.'));
+      failure.connectionFailure = error.name === 'AbortError' ? 'timeout' : phase;
+      throw failure;
+    }
+    if (!online) error.connectionFailure = phase;
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+async function bindInstallation(code) {
+  const deadline = Date.now() + 600000;
+  while (Date.now() < deadline) {
+    const result = await api('bind', {code});
+    if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) {
+      await resetCommands();
+      return result;
+    }
+    if (!result.pending) break;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  throw new Error(t('Pairing could not be confirmed. Get a new code in Telegram.',
+    'Привязка не подтверждена. Получите новый код в Telegram.'));
+}
+
+async function refresh() {
+  const state = await api('status', {});
+  generation = state.generation;
+  applyLanguage(state.language);
+  await observeGeneration(generation);
+  known = true;
+}
+
+async function run(operation) {
+  if (busy) return;
+  busy = true;
+  render();
+  try { await operation(); }
+  catch (error) { element('message').textContent = error.message; }
+  finally { busy = false; render(); }
+}
+
+element('pair').onsubmit = event => {
+  event.preventDefault();
+  run(async () => {
+    const result = await bindInstallation(element('code').value.trim().toUpperCase());
+    generation = result.generation;
+    element('code').value = '';
+    element('message').textContent = '';
+    try { await refresh(); } catch { /* The next refresh can load account settings. */ }
+  });
+};
+async function testNotification(current, started = performance.now()) {
+  const result = await api('test', {generation: current});
+  const elapsed = Math.max(0, Math.round(performance.now() - started));
+  if (result.delivery !== 'delivered' || typeof result.test !== 'string')
+    throw new Error(t('Telegram did not confirm the test notification.', 'Telegram не подтвердил проверочное уведомление'));
+  // The server already published a complete result; the game measurement is optional.
+  try { await api('test', {generation: current, test: result.test, elapsed}); } catch {}
+}
+element('test').onclick = () => run(async () => {
+  await testNotification(generation);
+  element('message').textContent = t('Test sent. Check Telegram for the timing.', 'Проверочное уведомление отправлено, задержка указана в Telegram');
+});
+element('unlink').onclick = () => run(async () => {
+  await api('unlink', {generation});
+  await resetCommands();
+  generation = null;
+  element('message').textContent = t('Telegram disconnected', 'Telegram отключён');
+});
+element('language').onclick = () => {
+  languagePickerOpen = !languagePickerOpen;
+  render();
+  if (languagePickerOpen) element('language-' + language).focus();
+};
+for (const choice of Object.keys(languageNames)) {
+  element('language-' + choice).onclick = () => {
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+    if (choice !== language) run(async () => {
+      await changePanelLanguage(choice, generation);
+      element('message').textContent = '';
+    });
+  };
+}
+
+function commandLoop(lab = false) {
+  let inFlight = false, pendingHash = false;
+  async function poll() {
+    const hash = location.hash;
+    const approval = /^#approve=([a-f0-9]{32}):([1-9][0-9]{0,14}):(\d+)$/.exec(hash);
+    const input = /^#poll=(\d+):(?:([a-f0-9]{32}):([1-9][0-9]{0,14}))?$/.exec(hash);
+    if (!input && !approval) return;
+    if (inFlight) { pendingHash = true; return; }
+    const pulse = approval ? approval[3] : input[1];
+    inFlight = true;
+    document.title = 'busy:commands:' + pulse;
+    try {
+      await settleCommands();
+      if (approval) {
+        const active = await commandStore(state => {
+          const item = state.active;
+          if (!item || item.generation !== approval[1] || item.id !== Number(approval[2]) ||
+              !isPlay(item.action) || item.outcome || item.phase !== 'received' || item.expires <= Date.now()) return null;
+          item.phase = 'armed';
+          return {...item};
+        });
+        document.title = active ? ['execute',active.generation,active.id,active.action,active.expires,pulse].join(':')
+          : 'execute:none:' + pulse;
+        return;
+      }
+      const receipt = await commandStore(state => state.receipt || null);
+      const result = await api('poll', {generation: receipt?.generation || input[2],
+        ack: receipt?.id || (input[3] ? Number(input[3]) : 0), ...(lab ? {lab: true} : {})});
+      const current = result.generation;
+      await observeGeneration(current);
+      if (!current || !/^[0-9a-f]{32}$/.test(current)) {
+        document.title = 'owner:none:' + pulse;
+      } else {
+        const command = result.command;
+        if (validCommand(command) && await receiveCommand(current, command))
+          document.title = ['katka',current,command.id,command.action,command.expires,pulse].join(':');
+        else document.title = 'owner:' + current + ':' + pulse;
+      }
+    } catch (error) {
+      if (error.httpStatus === 409) await resetCommands();
+      document.title = error.httpStatus === 409 ? 'owner:none:' + pulse : 'transport:offline:' + pulse;
+    } finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(poll); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange', poll);
+  document.title = 'ready:commands';
+  poll();
+}
+
+function commandResultLoop() {
+  let inFlight = false, pendingHash = false;
+  async function report() {
+    const hash = location.hash;
+    const input = /^#(\d+):([a-f0-9]{32}):([1-9][0-9]{0,14}):(queued|already_open|failed|unconfirmed|cancelled|watching)$/.exec(hash);
+    if (!input) return;
+    if (inFlight) { pendingHash = true; return; }
+    inFlight = true;
+    document.title = 'busy:result:' + input[1];
+    try {
+      await commandStore(state => saveOutcome(state, input[2], Number(input[3]), input[4]));
+      // The receipt acknowledges durable local ownership, even if the network is offline.
+      document.title = 'result:' + input[2] + ':' + input[3];
+    } catch (error) {
+      document.title = 'transport:offline:' + input[1];
+    } finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(report); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange', report);
+  document.title = 'ready:result';
+  report();
+}
+
+function rosterLoop() {
+  let inFlight = false, pendingHash = false;
+  async function inspect() {
+    const hash = location.hash;
+    const ack = /^#ack=([a-f0-9]{32}):([1-9][0-9]{0,14}):(event_sent|failed):(\d+)$/.exec(hash);
+    const input = /^#(\d+):(ready|waiting)$/.exec(hash);
+    if (!input && !ack) return;
+    if (inFlight) { pendingHash = true; return; }
+    const pulse = ack ? ack[4] : input[1];
+    inFlight = true; document.title = 'busy:roster:' + pulse;
+    try {
+      await settleCommands();
+      const claimed = await commandStore(state => {
+        const item = state.active;
+        if (ack) {
+          if (item && item.generation === ack[1] && item.id === Number(ack[2]) && !item.outcome) {
+            if (ack[3] === 'failed') saveOutcome(state,item.generation,item.id,'failed');
+            else if (item.phase === 'activation_reserved') item.phase = 'event_sent';
+          }
+          return null;
+        }
+        if (input[2] !== 'ready' || !item || !isPlay(item.action) || item.outcome ||
+            item.phase !== 'armed' || item.expires <= Date.now()) return null;
+        item.phase = 'activation_reserved';
+        return {...item};
+      });
+      document.title = claimed ? ['roster',claimed.generation,claimed.id,claimed.action,claimed.expires,pulse].join(':')
+        : 'roster:none:' + pulse;
+    } catch { document.title = 'roster:error:' + pulse; }
+    finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(inspect); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange',inspect);
+  document.title = 'ready:roster';
+  inspect();
+}
+
+function queueStateLoop() {
+  let inFlight = false, pendingHash = false, lastTelemetry = 0, lastState = '', telemetryBusy = false;
+  async function publishState(input) {
+    if (telemetryBusy || input[2] === lastState && Date.now()-lastTelemetry < 10000) return;
+    telemetryBusy=true;
+    try {
+    const current = await api('status', {});
+    if (!current.generation) return;
+    await api('telemetry',{generation:current.generation,telemetry:{state:input[2],observed:Number(input[1])}});
+    lastState=input[2]; lastTelemetry=Date.now();
+    } finally { telemetryBusy=false; }
+  }
+  async function inspect() {
+    const hash = location.hash;
+    const input = /^#(\d+):(waiting|idle|party|connecting|unknown)$/.exec(hash);
+    if (!input) return;
+    if (inFlight) { pendingHash = true; return; }
+    inFlight = true; document.title = 'busy:state:' + input[1];
+    try {
+      await settleCommands();
+      await commandStore(state => {
+        const item = state.active, observed = Number(input[1]);
+        if (!item || item.outcome || item.expires <= Date.now() || observed < item.receivedAt ||
+            Math.abs(Date.now()-observed) > 5000) return;
+        if (input[2] === 'waiting' && isPlay(item.action) &&
+            ['armed','activation_reserved','event_sent'].includes(item.phase))
+          saveOutcome(state,item.generation,item.id,'queued');
+        else if (input[2] === 'idle' && item.action === '/cancel')
+          saveOutcome(state,item.generation,item.id,'cancelled');
+      });
+      publishState(input).catch(() => {});
+      document.title = 'state:' + input[1];
+    } catch { document.title = 'state:error:' + input[1]; }
+    finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(inspect); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange',inspect);
+  document.title = 'ready:state';
+  inspect();
+}
+
+function notificationMode(next) {
+  if (!fullAccess()) return 'auto';
+  const key = 'katka_notifications';
+  if (['on', 'off', 'auto'].includes(next)) localStorage.setItem(key, next);
+  const saved = localStorage.getItem(key);
+  return ['on', 'off', 'auto'].includes(saved) ? saved : 'auto';
+}
+
+async function reportMatch() {
+  const receipt = location.hash.slice(1);
+  const parts = /^([a-f0-9]{32}):([1-9][0-9]{0,19})(?::(bot|manual))?$/.exec(receipt);
+  if (!parts) return;
+  while (location.hash.slice(1) === receipt) {
+    try {
+      const state = await api('status', {});
+      const mode = notificationMode();
+      // Receipts without an origin come from older VPKs; retain their behavior.
+      // Report all matches: the server updates the search card and applies preferences.
+      if (state.generation === parts[1]) {
+        await api('match', {generation: parts[1], match: parts[2],origin:parts[3]});
+      }
+      document.title = 'received:' + receipt;
+      return;
+    } catch (error) {
+      if (error.terminalDelivery) { document.title = 'received:' + receipt; return; }
+      await new Promise(resolve => setTimeout(resolve, 4000));
+    }
+  }
+}
+const view = new URLSearchParams(location.search).get('view');
+if (view === 'native') {
+  document.querySelector('main').hidden = true;
+  let lastRequest;
+  let currentGeneration;
+  async function handleNative() {
+    const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru|baseline|cached|lean)$/.exec(location.hash);
+    if (!input || lastRequest === input[0]) return;
+    lastRequest = input[0];
+    const [, id, action, code] = input;
+    const timing = labPanel && action === 'status' && labStrategies.includes(code) ? {strategy: code} : null;
+    const clicked = action === 'test' && /^\d{13}$/.test(code) ? Number(code) : Date.now();
+    const started = performance.now() - Math.min(120000, Math.max(0, Date.now() - clicked));
+    let state = 'offline', result = 'status';
+    try {
+      if (action === 'bind') {
+        const binding = await bindInstallation(code);
+        currentGeneration = binding.generation;
+        state = 'linked'; result = 'bound';
+        try { applyLanguage((await api('status', {})).language); } catch {}
+      } else if (action === 'language' && currentGeneration) {
+        state = 'linked';
+        await changePanelLanguage(code, currentGeneration);
+        result = 'language';
+      } else {
+        const current = await api('status', {}, timing);
+        state = current.generation ? 'linked' : 'unlinked';
+        if (lastRequest === input[0]) {
+          currentGeneration = current.generation;
+          applyLanguage(current.language);
+        }
+        await observeGeneration(current.generation);
+        if (action === 'notifications') {
+          await api('settings',{generation:current.generation,telemetry:{mode:code}});
+          notificationMode(code); result = 'notifications';
+        }
+        if (action === 'language' && lastRequest === input[0]) {
+          await changePanelLanguage(code, current.generation);
+          result = 'language';
+        }
+        if (action === 'test' || action === 'unlink') {
+          if (action === 'test') await testNotification(current.generation, started);
+          else await api(action, {generation: current.generation});
+          if (action === 'unlink') { await resetCommands(); currentGeneration = null; state = 'unlinked'; }
+          result = action === 'test' ? 'tested' : 'unbound';
+        }
+      }
+    } catch (error) {
+      result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
+      if (action === 'language' && error.httpStatus === 409) currentGeneration = null;
+      if (state === 'offline' && online && action === 'bind') state = 'unlinked';
+      if (error.connectionFailure || !online) {
+        state = 'offline';
+        result = 'connection_' + (error.connectionFailure || 'unknown');
+      }
+    }
+    if (lastRequest === input[0]) {
+      const title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode(), accessTier, language];
+      if (timing) title.push(['lab', timing.http ?? 'none', timing.gateway ?? 'none', timing.browser ?? 'none'].join(','));
+      document.title = title.join(':');
+    }
+  }
+  window.addEventListener('hashchange', handleNative);
+  handleNative();
+} else if (view === 'match') {
+  document.querySelector('main').hidden = true;
+  window.addEventListener('hashchange', reportMatch);
+  reportMatch();
+} else if (view === 'commands') {
+  document.querySelector('main').hidden = true;
+  commandLoop(labPanel);
+} else if (view === 'result') {
+  document.querySelector('main').hidden = true;
+  commandResultLoop();
+} else if (view === 'roster') {
+  document.querySelector('main').hidden = true;
+  rosterLoop();
+} else if (view === 'state') {
+  document.querySelector('main').hidden = true;
+  queueStateLoop();
+} else {
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !languagePickerOpen) return;
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+  });
+  run(refresh);
+  setInterval(() => run(refresh), 7000);
+}
+</script>
+</html>
