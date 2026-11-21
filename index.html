@@ -239,7 +239,8 @@ function render() {
       ? t('Server unreachable', 'Нет связи с сервером') : t('Connecting to the server…', 'Подключаемся к серверу…'),
     'code-label': t('Telegram code', 'Код из Telegram'),
     bind: t('Connect', 'Подключить'),
-    status: t('Telegram connected', 'Telegram подключён'),
+    status: online ? t('Telegram connected', 'Telegram подключён') :
+      t('Last known status: Telegram connected', 'Последний известный статус — Telegram подключён'),
     test: t('Send a test notification', 'Проверить уведомление'),
     unlink: t('Disconnect Telegram', 'Отключить Telegram'),
   };
@@ -263,7 +264,7 @@ function render() {
 
 async function api(action, data) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), action === 'language' ? 40000 : 20000);
+  const timer = setTimeout(() => abort.abort(), ['language', 'unlink'].includes(action) ? 40000 : 20000);
   let phase = 'storage';
   try {
     const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
@@ -598,6 +599,13 @@ if (view === 'native') {
         state = 'linked';
         await changePanelLanguage(code, currentGeneration);
         result = 'language';
+      } else if (action === 'unlink') {
+        const generation = currentGeneration === undefined ? (await api('status', {})).generation : currentGeneration;
+        state = generation ? 'linked' : 'unlinked';
+        if (generation) await api('unlink', {generation});
+        currentGeneration = null;
+        state = 'unlinked'; result = 'unbound';
+        await observeGeneration(null).catch(() => {});
       } else {
         const current = await api('status', {});
         state = current.generation ? 'linked' : 'unlinked';
@@ -614,16 +622,15 @@ if (view === 'native') {
           await changePanelLanguage(code, current.generation);
           result = 'language';
         }
-        if (action === 'test' || action === 'unlink') {
-          if (action === 'test') await testNotification(current.generation, started);
-          else await api(action, {generation: current.generation});
-          if (action === 'unlink') { await resetCommands(); currentGeneration = null; state = 'unlinked'; }
-          result = action === 'test' ? 'tested' : 'unbound';
+        if (action === 'test') {
+          await testNotification(current.generation, started);
+          result = 'tested';
         }
       }
     } catch (error) {
       result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
       if (action === 'language' && error.httpStatus === 409) currentGeneration = null;
+      if (action === 'unlink' && error.httpStatus === 409) result = 'unlink_changed';
       if (state === 'offline' && online && action === 'bind') state = 'unlinked';
       if (error.connectionFailure || !online) {
         state = 'offline';
