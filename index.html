@@ -373,7 +373,27 @@ function render() {
   for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
 }
 
+function withTimeout(operation, milliseconds, phase) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(t(
+      'Telelock did not respond in time. Try connecting again.',
+      'Telelock не ответил вовремя. Повторите подключение.')), {connectionFailure: phase})), milliseconds);
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function api(action, data, timing) {
+  try {
+    return await withTimeout(apiRequest(action, data, timing),
+      ['status', 'language', 'unlink'].includes(action) ? 45000 : 25000, 'timeout');
+  } catch (error) {
+    if (error.connectionFailure) { online = false; lastPing = null; }
+    throw error;
+  }
+}
+
+async function apiRequest(action, data, timing) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), ['status', 'language', 'unlink'].includes(action) ? 40000 : 20000);
   let phase = 'storage';
@@ -384,7 +404,7 @@ async function api(action, data, timing) {
       throw new Error(t('The game server is not configured yet.', 'Игровой сервер ещё не подключён'));
     }
     const gateway = configuredGateway || location.origin;
-    const key = await installationKey();
+    const key = await withTimeout(installationKey(), 10000, 'storage');
     phase = 'network';
     const started = performance.now();
     const endpoint = new URL('/v1/' + action, gateway);
@@ -407,6 +427,7 @@ async function api(action, data, timing) {
       timing.browser = entry ? Math.round(readAt - entry.responseEnd) : 'none';
     }
     if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
+    if (abort.signal.aborted) throw Object.assign(new Error('Request timed out'), {name: 'AbortError'});
     online = true;
     if (!response.ok) {
       const error = new Error(result.error || t('The server rejected the request.', 'Сервер отклонил запрос'));
@@ -430,18 +451,24 @@ async function api(action, data, timing) {
 }
 
 async function bindInstallation(code) {
-  const deadline = Date.now() + 600000;
-  while (Date.now() < deadline) {
-    const result = await api('bind', {code});
-    if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) {
-      await resetCommands();
-      return result;
+  let active = true;
+  const connect = async () => {
+    while (active) {
+      const result = await api('bind', {code});
+      if (!active) return;
+      if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) {
+        await withTimeout(resetCommands(), 10000, 'storage');
+        if (!active) return;
+        return result;
+      }
+      if (!result.pending) break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    if (!result.pending) break;
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  throw new Error(t('Pairing could not be confirmed. Get a new code in Telegram.',
-    'Привязка не подтверждена. Получите новый код в Telegram.'));
+    throw new Error(t('Pairing could not be confirmed. Get a new code in Telegram.',
+      'Привязка не подтверждена. Получите новый код в Telegram.'));
+  };
+  try { return await withTimeout(connect(), 35000, 'timeout'); }
+  finally { active = false; }
 }
 
 async function refresh() {
@@ -741,6 +768,7 @@ if (view === 'native') {
         currentGeneration = binding.generation;
         cacheBinding(currentGeneration);
         state = 'linked'; result = 'bound';
+        if (lastRequest === input[0]) nativeReply(id, state, result);
         try { await refreshProfile(); } catch {}
       } else if (action === 'unlink') {
         const current = currentGeneration === undefined ? (await refreshProfile()).generation : currentGeneration;
