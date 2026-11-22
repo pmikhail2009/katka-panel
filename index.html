@@ -77,6 +77,8 @@ let known = false;
 let online = false;
 let identity;
 let lastPing = null;
+const labPanel = new URLSearchParams(location.search).get('lab') === '1';
+const labStrategies = ['baseline', 'cached', 'lean'];
 let accessTier = 'free';
 const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
 
@@ -91,12 +93,121 @@ function applyLanguage(next) {
 }
 const t = (en, ru) => language === 'ru' ? ru : en;
 
-async function changePanelLanguage(next, current) {
-  if (current) {
-    const result = await api('language', { generation: current, language: next });
-    if (result.language !== next) throw new Error(t('Could not change the language.', 'Не удалось изменить язык.'));
+// Display cache only. Every command and protected operation is still authorized by the gateway.
+const profileKey = 'telelock_profile_v1';
+const profileScope = document.querySelector('meta[name="katka-gateway"]').content || location.origin || '';
+let profileSync;
+let volatileProfile;
+function profileRevision() { return Date.now() + ':' + Math.random().toString(36).slice(2); }
+function readProfile() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(profileKey)); } catch {}
+  if (volatileProfile) saved = volatileProfile;
+  if (!saved || saved.version !== 1 || saved.scope !== profileScope ||
+      !(saved.generation === null || /^[a-f0-9]{32}$/.test(saved.generation)) ||
+      !['free', 'owner', 'test'].includes(saved.tier) || !['en', 'ru'].includes(saved.language) ||
+      !['on', 'off', 'auto'].includes(saved.mode) || typeof saved.epoch !== 'string' || typeof saved.revision !== 'string') {
+    let mode;
+    try { mode = localStorage.getItem('katka_notifications'); } catch {}
+    return { version: 1, scope: profileScope, generation: null, tier: 'free', language,
+      mode: ['on', 'off', 'auto'].includes(mode) ? mode : 'auto', pending: {}, epoch: '', revision: '' };
   }
-  applyLanguage(next);
+  const pending = {};
+  for (const field of ['language', 'notifications']) {
+    const edit = saved.pending?.[field];
+    const allowed = field === 'language' ? ['en', 'ru'] : ['on', 'off', 'auto'];
+    if (edit && typeof edit.id === 'string' && edit.generation === saved.generation &&
+        allowed.includes(edit.value)) pending[field] = edit;
+  }
+  return { ...saved, pending };
+}
+function writeProfile(profile, required = false) {
+  profile.revision = profileRevision();
+  try {
+    localStorage.setItem(profileKey, JSON.stringify(profile));
+    volatileProfile = undefined;
+  } catch {
+    if (required) throw Object.assign(new Error(t('Could not save settings on this PC.', 'Не удалось сохранить настройки на этом ПК.')),
+      { connectionFailure: 'storage' });
+    volatileProfile = profile;
+    return false;
+  }
+  // Keep older VPKs and the match reporter compatible with the same preferences.
+  applyLanguage(profile.language);
+  try { localStorage.setItem('katka_notifications', profile.mode); } catch {}
+  return true;
+}
+function displayProfile(profile = readProfile()) {
+  generation = profile.generation;
+  accessTier = profile.tier;
+  applyLanguage(profile.language);
+  return profile;
+}
+function saveLocalPreference(field, value) {
+  const values = field === 'language' ? ['en', 'ru'] : field === 'notifications' ? ['on', 'off', 'auto'] : [];
+  if (!values.includes(value)) throw new Error('Invalid local preference');
+  const profile = readProfile();
+  profile[field === 'language' ? 'language' : 'mode'] = value;
+  profile.pending[field] = { value, generation: profile.generation, id: profileRevision() };
+  writeProfile(profile, true);
+  return displayProfile(profile);
+}
+function cacheBinding(current) {
+  const previous = readProfile();
+  const profile = { ...previous, generation: current, tier: 'free', pending: {}, epoch: profileRevision() };
+  writeProfile(profile);
+  displayProfile(profile);
+  known = true;
+  return profile;
+}
+async function refreshProfile(timing) {
+  const before = readProfile();
+  const current = await api('status', {}, timing);
+  const profile = readProfile();
+  // An older window/request cannot restore a binding that has since been replaced or removed.
+  if (profile.epoch !== before.epoch) return displayProfile(profile);
+  const changed = profile.generation !== (current.generation || null);
+  const wasUnresolved = profile.generation === null;
+  profile.generation = current.generation || null;
+  profile.tier = ['owner', 'test'].includes(current.tier) ? current.tier : 'free';
+  if (changed) {
+    if (wasUnresolved) {
+      for (const edit of Object.values(profile.pending)) edit.generation = profile.generation;
+    } else profile.pending = {};
+    profile.epoch = profileRevision();
+  }
+  const fresh = changed || profile.revision === before.revision;
+  if (fresh && !profile.pending.language && ['en', 'ru'].includes(current.language)) profile.language = current.language;
+  if (fresh && !profile.pending.notifications && ['on', 'off', 'auto'].includes(current.settings?.mode)) profile.mode = current.settings.mode;
+  if (profile.tier === 'free') { delete profile.pending.notifications; profile.mode = 'auto'; }
+  if (!profile.generation) profile.pending = {};
+  writeProfile(profile);
+  known = true;
+  await observeGeneration(profile.generation);
+  return displayProfile(profile);
+}
+async function syncPreferences() {
+  if (profileSync) return profileSync;
+  profileSync = (async () => {
+    for (const field of ['language', 'notifications']) {
+      // Keep only the most recent edit, including changes made while a request was in flight.
+      for (;;) {
+        const before = readProfile(), edit = before.pending[field];
+        if (!edit || !before.generation) break;
+        const result = field === 'language'
+          ? await api('language', { generation: edit.generation, language: edit.value })
+          : await api('settings', { generation: edit.generation, telemetry: { mode: edit.value } });
+        if (field === 'language' && result.language !== edit.value) throw new Error('Language was not confirmed');
+        const profile = readProfile();
+        if (profile.epoch !== before.epoch) break;
+        if (profile.pending[field]?.id !== edit.id) continue;
+        delete profile.pending[field];
+        writeProfile(profile);
+        displayProfile(profile);
+      }
+    }
+  })();
+  try { await profileSync; } finally { profileSync = undefined; }
 }
 
 function installationKey() {
@@ -249,7 +360,7 @@ function render() {
   languageButton.title = t('Language', 'Язык');
   languageButton.setAttribute('aria-label', languageButton.title);
   languageButton.setAttribute('aria-expanded', String(languagePickerOpen));
-  languageButton.disabled = !online || busy;
+  languageButton.disabled = false;
   element('language-picker').hidden = !languagePickerOpen;
   for (const [choice, name] of Object.entries(languageNames)) {
     const option = element('language-' + choice);
@@ -262,7 +373,7 @@ function render() {
   for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
 }
 
-async function api(action, data) {
+async function api(action, data, timing) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), ['status', 'language', 'unlink'].includes(action) ? 40000 : 20000);
   let phase = 'storage';
@@ -276,7 +387,9 @@ async function api(action, data) {
     const key = await installationKey();
     phase = 'network';
     const started = performance.now();
-    const response = await fetch(new URL('/v1/' + action, gateway), {
+    const endpoint = new URL('/v1/' + action, gateway);
+    if (timing) endpoint.searchParams.set('lab', timing.strategy);
+    const response = await fetch(endpoint, {
       // API responses already use Cache-Control: no-store. Keep CORS permissions reusable.
       method: 'POST', cache: 'default', credentials: 'omit', redirect: 'error',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
@@ -284,8 +397,15 @@ async function api(action, data) {
     });
     phase = 'response';
     const result = await response.json();
-    if (result.settings && ['on','off','auto'].includes(result.settings.mode)) localStorage.setItem('katka_notifications',result.settings.mode);
-    if (action === 'status') accessTier = ['owner', 'test'].includes(result.tier) ? result.tier : 'free';
+    const readAt = performance.now();
+    if (timing) {
+      const entry = performance.getEntriesByName(endpoint.href, 'resource')
+        .filter(item => item.startTime >= started && item.responseEnd > 0 && item.responseEnd <= readAt).pop();
+      const gatewayTime = entry?.serverTiming?.find(item => item.name === 'gateway')?.duration;
+      timing.http = entry ? Math.round(entry.duration) : 'none';
+      timing.gateway = Number.isFinite(gatewayTime) ? Math.round(gatewayTime) : 'none';
+      timing.browser = entry ? Math.round(readAt - entry.responseEnd) : 'none';
+    }
     if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
     online = true;
     if (!response.ok) {
@@ -325,11 +445,8 @@ async function bindInstallation(code) {
 }
 
 async function refresh() {
-  const state = await api('status', {});
-  generation = state.generation;
-  applyLanguage(state.language);
-  await observeGeneration(generation);
-  known = true;
+  await refreshProfile();
+  await syncPreferences();
 }
 
 async function run(operation) {
@@ -345,7 +462,7 @@ element('pair').onsubmit = event => {
   event.preventDefault();
   run(async () => {
     const result = await bindInstallation(element('code').value.trim().toUpperCase());
-    generation = result.generation;
+    cacheBinding(result.generation);
     element('code').value = '';
     element('message').textContent = '';
     try { await refresh(); } catch { /* The next refresh can load account settings. */ }
@@ -366,7 +483,7 @@ element('test').onclick = () => run(async () => {
 element('unlink').onclick = () => run(async () => {
   await api('unlink', {generation});
   await resetCommands();
-  generation = null;
+  cacheBinding(null);
   element('message').textContent = t('Telegram disconnected', 'Telegram отключён');
 });
 element('language').onclick = () => {
@@ -379,14 +496,18 @@ for (const choice of Object.keys(languageNames)) {
     languagePickerOpen = false;
     render();
     element('language').focus();
-    if (choice !== language) run(async () => {
-      await changePanelLanguage(choice, generation);
-      element('message').textContent = '';
-    });
+    if (choice !== language) {
+      try { saveLocalPreference('language', choice); }
+      catch (error) { element('message').textContent = error.message; render(); return; }
+      render();
+      syncPreferences().then(() => { element('message').textContent = ''; render(); })
+        .catch(() => { element('message').textContent = t('Saved on this PC. Telegram will sync when connected.',
+          'Сохранено на ПК. Синхронизируем с Telegram после подключения.'); render(); });
+    }
   };
 }
 
-function commandLoop() {
+function commandLoop(lab = false) {
   let inFlight = false, pendingHash = false;
   async function poll() {
     const hash = location.hash;
@@ -413,7 +534,7 @@ function commandLoop() {
       }
       const receipt = await commandStore(state => state.receipt || null);
       const result = await api('poll', {generation: receipt?.generation || input[2],
-        ack: receipt?.id || (input[3] ? Number(input[3]) : 0)});
+        ack: receipt?.id || (input[3] ? Number(input[3]) : 0), ...(lab ? {lab: true} : {})});
       const current = result.generation;
       await observeGeneration(current);
       if (!current || !/^[0-9a-f]{32}$/.test(current)) {
@@ -580,49 +701,62 @@ async function reportMatch() {
 const view = new URLSearchParams(location.search).get('view');
 if (view === 'native') {
   document.querySelector('main').hidden = true;
+  const profileProtocol = new URLSearchParams(location.search).get('profile') === '1';
   let lastRequest;
   let currentGeneration;
+  const restored = displayProfile();
+  if (restored.revision) { currentGeneration = restored.generation; known = true; }
+  function nativeReply(id, state, result, timing) {
+    if (!profileProtocol && state.indexOf('cached_') === 0) return;
+    const profile = readProfile();
+    const title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none',
+      profile.tier === 'free' ? 'auto' : profile.mode, accessTier, language];
+    if (timing) title.push(['lab', timing.http ?? 'none', timing.gateway ?? 'none', timing.browser ?? 'none'].join(','));
+    if (profileProtocol) title.push('pending,' + Number(!!profile.pending.language) + ',' + Number(!!profile.pending.notifications));
+    document.title = title.join(':');
+  }
   async function handleNative() {
-    const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru)$/.exec(location.hash);
+    const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru|baseline|cached|lean)$/.exec(location.hash);
     if (!input || lastRequest === input[0]) return;
     lastRequest = input[0];
     const [, id, action, code] = input;
+    const timing = labPanel && action === 'status' && labStrategies.includes(code) ? {strategy: code} : null;
     const clicked = action === 'test' && /^\d{13}$/.test(code) ? Number(code) : Date.now();
     const started = performance.now() - Math.min(120000, Math.max(0, Date.now() - clicked));
     let state = 'offline', result = 'status';
     try {
-      if (action === 'bind') {
+      if (action === 'status' && !timing) {
+        displayProfile();
+        nativeReply(id, generation ? 'cached_linked' : 'cached_unlinked', 'cached');
+      }
+      if (action === 'language' || action === 'notifications') {
+        const profile = saveLocalPreference(action, code);
+        currentGeneration = profile.generation;
+        nativeReply(id, generation ? 'cached_linked' : 'cached_unlinked', 'saved');
+        await syncPreferences();
+        state = online || !profileProtocol ? (currentGeneration ? 'linked' : 'unlinked') : (currentGeneration ? 'cached_linked' : 'cached_unlinked');
+        result = currentGeneration || online || !profileProtocol ? 'synced' : 'saved';
+      } else if (action === 'bind') {
         const binding = await bindInstallation(code);
         currentGeneration = binding.generation;
+        cacheBinding(currentGeneration);
         state = 'linked'; result = 'bound';
-        try { applyLanguage((await api('status', {})).language); } catch {}
-      } else if (action === 'language' && currentGeneration) {
-        state = 'linked';
-        await changePanelLanguage(code, currentGeneration);
-        result = 'language';
+        try { await refreshProfile(); } catch {}
       } else if (action === 'unlink') {
-        const generation = currentGeneration === undefined ? (await api('status', {})).generation : currentGeneration;
-        state = generation ? 'linked' : 'unlinked';
-        if (generation) await api('unlink', {generation});
+        const current = currentGeneration === undefined ? (await refreshProfile()).generation : currentGeneration;
+        state = current ? 'linked' : 'unlinked';
+        if (current) await api('unlink', {generation: current});
         currentGeneration = null;
+        cacheBinding(null);
         state = 'unlinked'; result = 'unbound';
         await observeGeneration(null).catch(() => {});
       } else {
-        const current = await api('status', {});
+        const current = await refreshProfile(timing);
         state = current.generation ? 'linked' : 'unlinked';
         if (lastRequest === input[0]) {
           currentGeneration = current.generation;
-          applyLanguage(current.language);
         }
-        await observeGeneration(current.generation);
-        if (action === 'notifications') {
-          await api('settings',{generation:current.generation,telemetry:{mode:code}});
-          notificationMode(code); result = 'notifications';
-        }
-        if (action === 'language' && lastRequest === input[0]) {
-          await changePanelLanguage(code, current.generation);
-          result = 'language';
-        }
+        await syncPreferences();
         if (action === 'test') {
           await testNotification(current.generation, started);
           result = 'tested';
@@ -630,15 +764,24 @@ if (view === 'native') {
       }
     } catch (error) {
       result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
-      if (action === 'language' && error.httpStatus === 409) currentGeneration = null;
       if (action === 'unlink' && error.httpStatus === 409) result = 'unlink_changed';
+      if (error.httpStatus === 409 && ['language', 'notifications', 'unlink'].includes(action)) {
+        try {
+          const current = await refreshProfile();
+          currentGeneration = current.generation;
+          state = currentGeneration ? 'linked' : 'unlinked';
+        } catch { state = 'offline'; }
+      }
       if (state === 'offline' && online && action === 'bind') state = 'unlinked';
       if (error.connectionFailure || !online) {
         state = 'offline';
         result = 'connection_' + (error.connectionFailure || 'unknown');
       }
     }
-    if (lastRequest === input[0]) document.title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none', notificationMode(), accessTier, language].join(':');
+    if (lastRequest === input[0]) {
+      if (!profileProtocol && result === 'synced') result = action === 'language' ? 'language' : 'notifications';
+      nativeReply(id, state, result, timing);
+    }
   }
   window.addEventListener('hashchange', handleNative);
   handleNative();
@@ -648,7 +791,7 @@ if (view === 'native') {
   reportMatch();
 } else if (view === 'commands') {
   document.querySelector('main').hidden = true;
-  commandLoop();
+  commandLoop(labPanel);
 } else if (view === 'result') {
   document.querySelector('main').hidden = true;
   commandResultLoop();
@@ -659,6 +802,9 @@ if (view === 'native') {
   document.querySelector('main').hidden = true;
   queueStateLoop();
 } else {
+  const restored = displayProfile();
+  known = !!restored.revision;
+  render();
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape' || !languagePickerOpen) return;
     languagePickerOpen = false;
