@@ -266,7 +266,7 @@ function render() {
 
 async function api(action, data, timing) {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), ['language', 'unlink'].includes(action) ? 40000 : 20000);
+  const timer = setTimeout(() => abort.abort(), ['status', 'language', 'unlink'].includes(action) ? 40000 : 20000);
   let phase = 'storage';
   try {
     const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
@@ -281,7 +281,8 @@ async function api(action, data, timing) {
     const endpoint = new URL('/v1/' + action, gateway);
     if (timing) endpoint.searchParams.set('lab', timing.strategy);
     const response = await fetch(endpoint, {
-      method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+      // API responses already use Cache-Control: no-store. Keep CORS permissions reusable.
+      method: 'POST', cache: 'default', credentials: 'omit', redirect: 'error',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
       body: JSON.stringify(data), signal: abort.signal
     });
