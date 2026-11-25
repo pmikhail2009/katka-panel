@@ -1,0 +1,1139 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta name="katka-gateway" content="https://katka-game-gateway.pmikhail2009.workers.dev"><title>Telelock X Prelock</title><main hidden></main>
+<script>
+
+'use strict';
+const element = id => document.getElementById(id);
+let generation = null;
+let busy = false;
+let known = false;
+let online = false;
+let identity;
+let lastPing = null;
+const labPanel = new URLSearchParams(location.search).get('lab') === '1';
+const labStrategies = ['baseline', 'cached', 'lean'];
+let accessTier = 'free';
+const fullAccess = () => true;
+
+let language = 'en';
+let languagePickerOpen = false;
+const languageNames = { en: 'English', ru: 'Русский' };
+try { if (localStorage.getItem('katka_language') === 'ru') language = 'ru'; } catch {}
+function applyLanguage(next) {
+  if (next !== 'en' && next !== 'ru') return;
+  language = next;
+  try { localStorage.setItem('katka_language', next); } catch {}
+}
+const t = (en, ru) => language === 'ru' ? ru : en;
+
+// Display cache only. Every command and protected operation is still authorized by the gateway.
+const profileKey = 'telelock_profile_v1';
+const profileScope = document.querySelector('meta[name="katka-gateway"]').content || location.origin || '';
+let profileSync;
+let volatileProfile;
+function profileRevision() { return Date.now() + ':' + Math.random().toString(36).slice(2); }
+function readProfile() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(profileKey)); } catch {}
+  if (volatileProfile) saved = volatileProfile;
+  if (!saved || saved.version !== 1 || saved.scope !== profileScope ||
+      !(saved.generation === null || /^[a-f0-9]{32}$/.test(saved.generation)) ||
+      !['free', 'owner', 'test'].includes(saved.tier) || !['en', 'ru'].includes(saved.language) ||
+      !['on', 'off', 'auto'].includes(saved.mode) || typeof saved.epoch !== 'string' || typeof saved.revision !== 'string') {
+    let mode;
+    try { mode = localStorage.getItem('katka_notifications'); } catch {}
+    return { version: 1, scope: profileScope, generation: null, tier: 'free', language,
+      mode: ['on', 'off', 'auto'].includes(mode) ? mode : 'auto', pending: {}, epoch: '', revision: '' };
+  }
+  const pending = {};
+  for (const field of ['language', 'notifications']) {
+    const edit = saved.pending?.[field];
+    const allowed = field === 'language' ? ['en', 'ru'] : ['on', 'off', 'auto'];
+    if (edit && typeof edit.id === 'string' && edit.generation === saved.generation &&
+        allowed.includes(edit.value)) pending[field] = edit;
+  }
+  return { ...saved, pending };
+}
+function writeProfile(profile, required = false) {
+  profile.revision = profileRevision();
+  try {
+    localStorage.setItem(profileKey, JSON.stringify(profile));
+    volatileProfile = undefined;
+  } catch {
+    if (required) throw Object.assign(new Error(t('Could not save settings on this PC.', 'Не удалось сохранить настройки на этом ПК.')),
+      { connectionFailure: 'storage' });
+    volatileProfile = profile;
+    return false;
+  }
+  // Keep older VPKs and the match reporter compatible with the same preferences.
+  applyLanguage(profile.language);
+  try { localStorage.setItem('katka_notifications', profile.mode); } catch {}
+  return true;
+}
+function displayProfile(profile = readProfile()) {
+  generation = profile.generation;
+  accessTier = profile.tier;
+  applyLanguage(profile.language);
+  return profile;
+}
+function saveLocalPreference(field, value) {
+  const values = field === 'language' ? ['en', 'ru'] : field === 'notifications' ? ['on', 'off', 'auto'] : [];
+  if (!values.includes(value)) throw new Error('Invalid local preference');
+  const profile = readProfile();
+  profile[field === 'language' ? 'language' : 'mode'] = value;
+  profile.pending[field] = { value, generation: profile.generation, id: profileRevision() };
+  writeProfile(profile, true);
+  return displayProfile(profile);
+}
+function cacheBinding(current) {
+  const previous = readProfile();
+  const profile = { ...previous, generation: current, tier: 'free', pending: {}, epoch: profileRevision() };
+  writeProfile(profile);
+  displayProfile(profile);
+  known = true;
+  return profile;
+}
+async function refreshProfile(timing) {
+  const before = readProfile();
+  const current = await api('status', {}, timing);
+  const profile = readProfile();
+  // An older window/request cannot restore a binding that has since been replaced or removed.
+  if (profile.epoch !== before.epoch) return displayProfile(profile);
+  const changed = profile.generation !== (current.generation || null);
+  const wasUnresolved = profile.generation === null;
+  profile.generation = current.generation || null;
+  profile.tier = ['owner', 'test'].includes(current.tier) ? current.tier : 'free';
+  if (changed) {
+    if (wasUnresolved) {
+      for (const edit of Object.values(profile.pending)) edit.generation = profile.generation;
+    } else profile.pending = {};
+    profile.epoch = profileRevision();
+  }
+  const fresh = changed || profile.revision === before.revision;
+  if (fresh && !profile.pending.language && ['en', 'ru'].includes(current.language)) profile.language = current.language;
+  if (fresh && !profile.pending.notifications && ['on', 'off', 'auto'].includes(current.settings?.mode)) profile.mode = current.settings.mode;
+  if (!profile.generation) profile.pending = {};
+  writeProfile(profile);
+  known = true;
+  // The command controller reconciles its mailbox against its own server poll.
+  // Displaying a verified connection must not wait for that IndexedDB mailbox.
+  return displayProfile(profile);
+}
+async function syncPreferences() {
+  if (profileSync) return profileSync;
+  profileSync = (async () => {
+    for (const field of ['language', 'notifications']) {
+      // Keep only the most recent edit, including changes made while a request was in flight.
+      for (;;) {
+        const before = readProfile(), edit = before.pending[field];
+        if (!edit || !before.generation) break;
+        const result = field === 'language'
+          ? await api('language', { generation: edit.generation, language: edit.value })
+          : await api('settings', { generation: edit.generation, telemetry: { mode: edit.value } });
+        if (field === 'language' && result.language !== edit.value) throw new Error('Language was not confirmed');
+        const profile = readProfile();
+        if (profile.epoch !== before.epoch) break;
+        if (profile.pending[field]?.id !== edit.id) continue;
+        delete profile.pending[field];
+        writeProfile(profile);
+        displayProfile(profile);
+      }
+    }
+  })();
+  try { await profileSync; } finally { profileSync = undefined; }
+}
+
+function installationKey() {
+  if (identity) return identity;
+  identity = new Promise((resolve, reject) => {
+    const open = indexedDB.open('katka-installation', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('keys', 'readwrite');
+      const store = tx.objectStore('keys');
+      const read = store.get('installation');
+      let key;
+      read.onsuccess = () => {
+        key = read.result;
+        if (!key) {
+          key = Array.from(crypto.getRandomValues(new Uint8Array(32)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+          store.add(key, 'installation');
+        }
+      };
+      tx.oncomplete = () => { db.close(); resolve(key); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }).catch(() => {
+    identity = undefined;
+    throw new Error(t('Could not save the installation key in the game browser.', 'Не удалось сохранить ключ установки в игровом браузере.'));
+  });
+  return identity;
+}
+
+// These records belong to the installation, not to a particular Panorama window.
+// All mutations run inside one synchronous IndexedDB transaction callback.
+const commandKeys = ['katka_active_command', 'katka_last_received', 'katka_result_outbox'];
+function commandStore(change) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('katka-installation', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result, tx = db.transaction('keys', 'readwrite');
+      const store = tx.objectStore('keys'), values = {};
+      let remaining = commandKeys.length, answer;
+      for (const key of commandKeys) {
+        const read = store.get(key);
+        read.onsuccess = () => {
+          values[key] = read.result;
+          if (--remaining) return;
+          try {
+            const state = {active: values[commandKeys[0]], receipt: values[commandKeys[1]], outbox: values[commandKeys[2]] || []};
+            answer = change(state);
+            [state.active, state.receipt, state.outbox].forEach((value, i) => {
+              if (value === undefined || value === null) store.delete(commandKeys[i]);
+              else store.put(value, commandKeys[i]);
+            });
+          } catch (error) { tx.abort(); reject(error); }
+        };
+      }
+      tx.oncomplete = () => { db.close(); resolve(answer); };
+      tx.onabort = () => { db.close(); reject(tx.error || new Error('Не удалось сохранить состояние команды')); };
+    };
+  });
+}
+function resetCommands() {
+  return commandStore(state => { state.active = undefined; state.receipt = undefined; state.outbox = []; });
+}
+function observeGeneration(current) {
+  return commandStore(state => {
+    if (!current || state.receipt && state.receipt.generation !== current || state.active && state.active.generation !== current) {
+      state.active = undefined; state.receipt = undefined;
+    }
+    state.outbox = state.outbox.filter(item => item.generation === current);
+  });
+}
+function saveOutcome(state, generation, command, status) {
+  const previous = state.outbox.find(item => item.generation === generation && item.command === command);
+  if (previous) return previous;
+  if (state.active && state.active.generation === generation && state.active.id === command) {
+    if (state.active.outcome) return null;
+    state.active.outcome = status;
+    state.active.phase = 'finished';
+  }
+  const item = {generation, command, status, created: Date.now(), delivered: false, lease: 0};
+  state.outbox.push(item);
+  // Delivered receipts remain long enough to deduplicate late local messages.
+  state.outbox = state.outbox.filter(entry => !entry.delivered || entry.created + 86400000 > Date.now());
+  return item;
+}
+async function settleCommands() {
+  await commandStore(state => {
+    const active = state.active;
+    if (active && !active.outcome && active.expires <= Date.now())
+      saveOutcome(state, active.generation, active.id, 'unconfirmed');
+  });
+}
+async function flushResults() {
+  const item = await commandStore(state => {
+    const next = state.outbox.find(entry => !entry.delivered && (entry.lease || 0) <= Date.now());
+    if (!next) return null;
+    next.lease = Date.now() + 25000;
+    return {...next};
+  });
+  if (!item) return;
+  let terminal = false;
+  try {
+    await api('result', {generation: item.generation, command: item.command, status: item.status});
+    terminal = true;
+  } catch (error) { terminal = [400, 404, 409].includes(error.httpStatus); }
+  await commandStore(state => {
+    const saved = state.outbox.find(entry => entry.generation === item.generation && entry.command === item.command);
+    if (saved) { saved.delivered = terminal; saved.lease = terminal ? 0 : Date.now() + 1500; }
+  });
+}
+function isPlay(action) { return ['/play_normal', '/play_ranked', '/play_street'].includes(action); }
+function validCommand(command) {
+  return command && Number.isSafeInteger(command.id) && command.id > 0 && command.id < 1e15 &&
+    Number.isSafeInteger(command.expires) && command.expires > Date.now() &&
+    (isPlay(command.action) || ['/cancel', '/watch_black'].includes(command.action));
+}
+function receiveCommand(current, command) {
+  return commandStore(state => {
+    if (state.receipt && state.receipt.generation === current && state.receipt.id === command.id) return false;
+    state.receipt = {generation: current, id: command.id};
+    if (command.action !== '/watch_black') {
+      if (state.active && !state.active.outcome)
+        saveOutcome(state, state.active.generation, state.active.id, 'unconfirmed');
+      state.active = {generation: current, id: command.id, action: command.action,
+        receivedAt: Date.now(), expires: Math.min(command.expires, Date.now() + 15000), phase: 'received'};
+    }
+    return true;
+  });
+}
+
+function render() {
+  document.documentElement.lang = language;
+  const labels = {
+    heading: t('Telelock — match alerts', 'Telelock — уведомления о матче'),
+    server: online ? t('Server online', 'Сервер на связи') : known
+      ? t('Server unreachable', 'Нет связи с сервером') : t('Connecting to the server…', 'Подключаемся к серверу…'),
+    'code-label': t('Telegram code', 'Код из Telegram'),
+    bind: t('Connect', 'Подключить'),
+    status: online ? t('Telegram connected', 'Telegram подключён') :
+      t('Last known status: Telegram connected', 'Последний известный статус — Telegram подключён'),
+    test: t('Send a test notification', 'Проверить уведомление'),
+    unlink: t('Disconnect Telegram', 'Отключить Telegram'),
+  };
+  for (const [id, label] of Object.entries(labels)) element(id).textContent = label;
+  const languageButton = element('language');
+  languageButton.title = t('Language', 'Язык');
+  languageButton.setAttribute('aria-label', languageButton.title);
+  languageButton.setAttribute('aria-expanded', String(languagePickerOpen));
+  languageButton.disabled = false;
+  element('language-picker').hidden = !languagePickerOpen;
+  for (const [choice, name] of Object.entries(languageNames)) {
+    const option = element('language-' + choice);
+    option.textContent = (choice === language ? '✓ ' : '') + name;
+    option.setAttribute('aria-pressed', String(choice === language));
+  }
+  element('pair').hidden = !known || Boolean(generation);
+  element('linked').hidden = !generation;
+  element('test').hidden = !fullAccess();
+  for (const id of ['bind', 'test', 'unlink']) element(id).disabled = !online || busy;
+}
+
+function withTimeout(operation, milliseconds, phase) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(t(
+      'Telelock did not respond in time. Try connecting again.',
+      'Telelock не ответил вовремя. Повторите подключение.')), {connectionFailure: phase})), milliseconds);
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function api(action, data, timing) {
+  try {
+    return await withTimeout(apiRequest(action, data, timing),
+      ['status', 'language', 'unlink'].includes(action) ? 45000 : 25000, 'timeout');
+  } catch (error) {
+    if (error.connectionFailure) { online = false; lastPing = null; }
+    throw error;
+  }
+}
+
+async function apiRequest(action, data, timing) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), ['status', 'language', 'unlink'].includes(action) ? 40000 : 20000);
+  let phase = 'storage';
+  try {
+    const configuredGateway = document.querySelector('meta[name="katka-gateway"]').content;
+    if (!configuredGateway && location.hostname.endsWith('.github.io')) {
+      online = false;
+      throw new Error(t('The game server is not configured yet.', 'Игровой сервер ещё не подключён'));
+    }
+    const gateway = configuredGateway || location.origin;
+    const key = await withTimeout(installationKey(), 10000, 'storage');
+    phase = 'network';
+    const started = performance.now();
+    const endpoint = new URL('/v1/' + action, gateway);
+    if (timing) endpoint.searchParams.set('lab', timing.strategy);
+    const response = await fetch(endpoint, {
+      // API responses already use Cache-Control: no-store. Keep CORS permissions reusable.
+      method: 'POST', cache: 'default', credentials: 'omit', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify(data), signal: abort.signal
+    });
+    phase = 'response';
+    const result = await response.json();
+    const readAt = performance.now();
+    if (timing) {
+      const entry = performance.getEntriesByName(endpoint.href, 'resource')
+        .filter(item => item.startTime >= started && item.responseEnd > 0 && item.responseEnd <= readAt).pop();
+      const gatewayTime = entry?.serverTiming?.find(item => item.name === 'gateway')?.duration;
+      timing.http = entry ? Math.round(entry.duration) : 'none';
+      timing.gateway = Number.isFinite(gatewayTime) ? Math.round(gatewayTime) : 'none';
+      timing.browser = entry ? Math.round(readAt - entry.responseEnd) : 'none';
+    }
+    if (action === 'status') lastPing = Math.max(0, Math.round(performance.now() - started));
+    if (abort.signal.aborted) throw Object.assign(new Error('Request timed out'), {name: 'AbortError'});
+    online = true;
+    if (!response.ok) {
+      const error = new Error(result.error || t('The server rejected the request.', 'Сервер отклонил запрос'));
+      error.httpStatus = response.status;
+      error.terminalDelivery = ['unknown', 'rejected', 'previous_binding'].includes(result.delivery);
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof SyntaxError || error.name === 'AbortError') {
+      online = false;
+      lastPing = null;
+      const failure = new Error(t('Check the connection. Telelock will reconnect automatically.',
+        'Проверьте соединение. Панель подключится автоматически.'));
+      failure.connectionFailure = error.name === 'AbortError' ? 'timeout' : phase;
+      throw failure;
+    }
+    if (!online) error.connectionFailure = phase;
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+async function bindInstallation(code) {
+  let active = true;
+  const connect = async () => {
+    while (active) {
+      const result = await api('bind', {code});
+      if (!active) return;
+      if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) {
+        return result;
+      }
+      if (!result.pending) break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error(t('Pairing could not be confirmed. Get a new code in Telegram.',
+      'Привязка не подтверждена. Получите новый код в Telegram.'));
+  };
+  try { return await withTimeout(connect(), 35000, 'timeout'); }
+  finally { active = false; }
+}
+
+async function refresh() {
+  await refreshProfile();
+  await syncPreferences();
+}
+
+async function run(operation) {
+  if (busy) return;
+  busy = true;
+  render();
+  try { await operation(); }
+  catch (error) { element('message').textContent = error.message; }
+  finally { busy = false; render(); }
+}
+
+element('pair').onsubmit = event => {
+  event.preventDefault();
+  run(async () => {
+    const result = await bindInstallation(element('code').value.trim().toUpperCase());
+    cacheBinding(result.generation);
+    element('code').value = '';
+    element('message').textContent = '';
+    try { await refresh(); } catch { /* The next refresh can load account settings. */ }
+  });
+};
+async function testNotification(current, started = performance.now()) {
+  const result = await api('test', {generation: current});
+  const elapsed = Math.max(0, Math.round(performance.now() - started));
+  if (result.delivery !== 'delivered' || typeof result.test !== 'string')
+    throw new Error(t('Telegram did not confirm the test notification.', 'Telegram не подтвердил проверочное уведомление'));
+  // The server already published a complete result; the game measurement is optional.
+  try { await api('test', {generation: current, test: result.test, elapsed}); } catch {}
+}
+element('test').onclick = () => run(async () => {
+  await testNotification(generation);
+  element('message').textContent = t('Test sent. Check Telegram for the timing.', 'Проверочное уведомление отправлено, задержка указана в Telegram');
+});
+element('unlink').onclick = () => run(async () => {
+  await api('unlink', {generation});
+  await resetCommands();
+  cacheBinding(null);
+  element('message').textContent = t('Telegram disconnected', 'Telegram отключён');
+});
+element('language').onclick = () => {
+  languagePickerOpen = !languagePickerOpen;
+  render();
+  if (languagePickerOpen) element('language-' + language).focus();
+};
+for (const choice of Object.keys(languageNames)) {
+  element('language-' + choice).onclick = () => {
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+    if (choice !== language) {
+      try { saveLocalPreference('language', choice); }
+      catch (error) { element('message').textContent = error.message; render(); return; }
+      render();
+      syncPreferences().then(() => { element('message').textContent = ''; render(); })
+        .catch(() => { element('message').textContent = t('Saved on this PC. Telegram will sync when connected.',
+          'Сохранено на ПК. Синхронизируем с Telegram после подключения.'); render(); });
+    }
+  };
+}
+
+function commandLoop(lab = false) {
+  let inFlight = false, pendingHash = false;
+  async function poll() {
+    const hash = location.hash;
+    const approval = /^#approve=([a-f0-9]{32}):([1-9][0-9]{0,14}):(\d+)$/.exec(hash);
+    const input = /^#poll=(\d+):(?:([a-f0-9]{32}):([1-9][0-9]{0,14}))?$/.exec(hash);
+    if (!input && !approval) return;
+    if (inFlight) { pendingHash = true; return; }
+    const pulse = approval ? approval[3] : input[1];
+    inFlight = true;
+    document.title = 'busy:commands:' + pulse;
+    try {
+      await settleCommands();
+      if (approval) {
+        const active = await commandStore(state => {
+          const item = state.active;
+          if (!item || item.generation !== approval[1] || item.id !== Number(approval[2]) ||
+              !isPlay(item.action) || item.outcome || item.phase !== 'received' || item.expires <= Date.now()) return null;
+          item.phase = 'armed';
+          return {...item};
+        });
+        document.title = active ? ['execute',active.generation,active.id,active.action,active.expires,pulse].join(':')
+          : 'execute:none:' + pulse;
+        return;
+      }
+      const receipt = await commandStore(state => state.receipt || null);
+      const result = await api('poll', {generation: receipt?.generation || input[2],
+        ack: receipt?.id || (input[3] ? Number(input[3]) : 0), ...(lab ? {lab: true} : {})});
+      const current = result.generation;
+      await observeGeneration(current);
+      if (!current || !/^[0-9a-f]{32}$/.test(current)) {
+        document.title = 'owner:none:' + pulse;
+      } else {
+        const command = result.command;
+        if (validCommand(command) && await receiveCommand(current, command))
+          document.title = ['katka',current,command.id,command.action,command.expires,pulse].join(':');
+        else document.title = 'owner:' + current + ':' + pulse;
+      }
+    } catch (error) {
+      if (error.httpStatus === 409) await resetCommands();
+      document.title = error.httpStatus === 409 ? 'owner:none:' + pulse : 'transport:offline:' + pulse;
+    } finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(poll); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange', poll);
+  document.title = 'ready:commands';
+  poll();
+}
+
+function commandResultLoop() {
+  let inFlight = false, pendingHash = false;
+  async function report() {
+    const hash = location.hash;
+    const input = /^#(\d+):([a-f0-9]{32}):([1-9][0-9]{0,14}):(queued|already_open|failed|unconfirmed|cancelled|watching)$/.exec(hash);
+    if (!input) return;
+    if (inFlight) { pendingHash = true; return; }
+    inFlight = true;
+    document.title = 'busy:result:' + input[1];
+    try {
+      await commandStore(state => saveOutcome(state, input[2], Number(input[3]), input[4]));
+      // The receipt acknowledges durable local ownership, even if the network is offline.
+      document.title = 'result:' + input[2] + ':' + input[3];
+    } catch (error) {
+      document.title = 'transport:offline:' + input[1];
+    } finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(report); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange', report);
+  document.title = 'ready:result';
+  report();
+}
+
+function rosterLoop() {
+  let inFlight = false, pendingHash = false;
+  async function inspect() {
+    const hash = location.hash;
+    const ack = /^#ack=([a-f0-9]{32}):([1-9][0-9]{0,14}):(event_sent|failed):(\d+)$/.exec(hash);
+    const input = /^#(\d+):(ready|waiting)$/.exec(hash);
+    if (!input && !ack) return;
+    if (inFlight) { pendingHash = true; return; }
+    const pulse = ack ? ack[4] : input[1];
+    inFlight = true; document.title = 'busy:roster:' + pulse;
+    try {
+      await settleCommands();
+      const claimed = await commandStore(state => {
+        const item = state.active;
+        if (ack) {
+          if (item && item.generation === ack[1] && item.id === Number(ack[2]) && !item.outcome) {
+            if (ack[3] === 'failed') saveOutcome(state,item.generation,item.id,'failed');
+            else if (item.phase === 'activation_reserved') item.phase = 'event_sent';
+          }
+          return null;
+        }
+        if (input[2] !== 'ready' || !item || !isPlay(item.action) || item.outcome ||
+            item.phase !== 'armed' || item.expires <= Date.now()) return null;
+        item.phase = 'activation_reserved';
+        return {...item};
+      });
+      document.title = claimed ? ['roster',claimed.generation,claimed.id,claimed.action,claimed.expires,pulse].join(':')
+        : 'roster:none:' + pulse;
+    } catch { document.title = 'roster:error:' + pulse; }
+    finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(inspect); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange',inspect);
+  document.title = 'ready:roster';
+  inspect();
+}
+
+function queueStateLoop() {
+  let inFlight = false, pendingHash = false, lastTelemetry = 0, lastState = '', telemetryBusy = false;
+  async function publishState(input) {
+    if (telemetryBusy || input[2] === lastState && Date.now()-lastTelemetry < 10000) return;
+    telemetryBusy=true;
+    try {
+    const current = await api('status', {});
+    if (!current.generation) return;
+    await api('telemetry',{generation:current.generation,telemetry:{state:input[2],observed:Number(input[1])}});
+    lastState=input[2]; lastTelemetry=Date.now();
+    } finally { telemetryBusy=false; }
+  }
+  async function inspect() {
+    const hash = location.hash;
+    const input = /^#(\d+):(waiting|idle|party|connecting|unknown)$/.exec(hash);
+    if (!input) return;
+    if (inFlight) { pendingHash = true; return; }
+    inFlight = true; document.title = 'busy:state:' + input[1];
+    try {
+      await settleCommands();
+      await commandStore(state => {
+        const item = state.active, observed = Number(input[1]);
+        if (!item || item.outcome || item.expires <= Date.now() || observed < item.receivedAt ||
+            Math.abs(Date.now()-observed) > 5000) return;
+        if (input[2] === 'waiting' && isPlay(item.action) &&
+            ['armed','activation_reserved','event_sent'].includes(item.phase))
+          saveOutcome(state,item.generation,item.id,'queued');
+        else if (input[2] === 'idle' && item.action === '/cancel')
+          saveOutcome(state,item.generation,item.id,'cancelled');
+      });
+      publishState(input).catch(() => {});
+      document.title = 'state:' + input[1];
+    } catch { document.title = 'state:error:' + input[1]; }
+    finally {
+      inFlight = false;
+      if (pendingHash || location.hash !== hash) { pendingHash = false; Promise.resolve().then(inspect); }
+      flushResults().catch(() => {});
+    }
+  }
+  window.addEventListener('hashchange',inspect);
+  document.title = 'ready:state';
+  inspect();
+}
+
+function notificationMode(next) {
+  if (!fullAccess()) return 'auto';
+  const key = 'katka_notifications';
+  if (['on', 'off', 'auto'].includes(next)) localStorage.setItem(key, next);
+  const saved = localStorage.getItem(key);
+  return ['on', 'off', 'auto'].includes(saved) ? saved : 'auto';
+}
+
+async function reportMatch() {
+  const receipt = location.hash.slice(1);
+  const parts = /^([a-f0-9]{32}):([1-9][0-9]{0,19})(?::(bot|manual))?$/.exec(receipt);
+  if (!parts) return;
+  while (location.hash.slice(1) === receipt) {
+    try {
+      const state = await api('status', {});
+      const mode = notificationMode();
+      // Receipts without an origin come from older VPKs; retain their behavior.
+      // Report all matches: the server updates the search card and applies preferences.
+      if (state.generation === parts[1]) {
+        await api('match', {generation: parts[1], match: parts[2],origin:parts[3]});
+      }
+      document.title = 'received:' + receipt;
+      return;
+    } catch (error) {
+      if (error.terminalDelivery) { document.title = 'received:' + receipt; return; }
+      await new Promise(resolve => setTimeout(resolve, 4000));
+    }
+  }
+}
+const view = 'prelock';
+if (view === 'prelock') {
+  document.querySelector('main').hidden = true;
+} else if (view === 'native') {
+  document.querySelector('main').hidden = true;
+  const profileProtocol = new URLSearchParams(location.search).get('profile') === '1';
+  let lastRequest;
+  let currentGeneration;
+  const restored = displayProfile();
+  if (restored.revision) { currentGeneration = restored.generation; known = true; }
+  function nativeReply(id, state, result, timing) {
+    if (!profileProtocol && state.indexOf('cached_') === 0) return;
+    const profile = readProfile();
+    const title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none',
+      profile.mode, accessTier, language];
+    if (timing) title.push(['lab', timing.http ?? 'none', timing.gateway ?? 'none', timing.browser ?? 'none'].join(','));
+    if (profileProtocol) title.push('pending,' + Number(!!profile.pending.language) + ',' + Number(!!profile.pending.notifications));
+    const next = title.join(':');
+    if (document.title !== next) document.title = next;
+  }
+  async function handleNative() {
+    const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru|baseline|cached|lean)$/.exec(location.hash);
+    if (!input || lastRequest === input[0]) return;
+    lastRequest = input[0];
+    const [, id, action, code] = input;
+    const timing = labPanel && action === 'status' && labStrategies.includes(code) ? {strategy: code} : null;
+    const clicked = action === 'test' && /^\d{13}$/.test(code) ? Number(code) : Date.now();
+    const started = performance.now() - Math.min(120000, Math.max(0, Date.now() - clicked));
+    let state = 'offline', result = 'status';
+    try {
+      if (action === 'status' && !timing) {
+        displayProfile();
+        nativeReply(id, generation ? 'cached_linked' : 'cached_unlinked', 'cached');
+      }
+      if (action === 'language' || action === 'notifications') {
+        const profile = saveLocalPreference(action, code);
+        currentGeneration = profile.generation;
+        nativeReply(id, generation ? 'cached_linked' : 'cached_unlinked', 'saved');
+        await syncPreferences();
+        state = online || !profileProtocol ? (currentGeneration ? 'linked' : 'unlinked') : (currentGeneration ? 'cached_linked' : 'cached_unlinked');
+        result = currentGeneration || online || !profileProtocol ? 'synced' : 'saved';
+      } else if (action === 'bind') {
+        const binding = await bindInstallation(code);
+        currentGeneration = binding.generation;
+        cacheBinding(currentGeneration);
+        state = 'linked'; result = 'bound';
+        if (lastRequest === input[0]) nativeReply(id, state, result);
+        try { await refreshProfile(); } catch {}
+      } else if (action === 'unlink') {
+        const current = currentGeneration === undefined ? (await refreshProfile()).generation : currentGeneration;
+        state = current ? 'linked' : 'unlinked';
+        if (current) await api('unlink', {generation: current});
+        currentGeneration = null;
+        cacheBinding(null);
+        state = 'unlinked'; result = 'unbound';
+        await observeGeneration(null).catch(() => {});
+      } else {
+        const current = await refreshProfile(timing);
+        state = current.generation ? 'linked' : 'unlinked';
+        if (lastRequest === input[0]) {
+          currentGeneration = current.generation;
+        }
+        if (action === 'status' && lastRequest === input[0]) nativeReply(id, state, result, timing);
+        await syncPreferences();
+        if (action === 'test') {
+          await testNotification(current.generation, started);
+          result = 'tested';
+        }
+      }
+    } catch (error) {
+      result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
+      if (action === 'bind' && new URLSearchParams(location.search).get('errors') === '1') {
+        if (error.httpStatus === 400) result = 'pairing_expired';
+        else if (error.httpStatus === 409) result = 'pairing_changed';
+        else if (error.httpStatus === 503) result = 'pairing_unavailable';
+      }
+      if (action === 'unlink' && error.httpStatus === 409) result = 'unlink_changed';
+      if (error.httpStatus === 409 && ['language', 'notifications', 'unlink'].includes(action)) {
+        try {
+          const current = await refreshProfile();
+          currentGeneration = current.generation;
+          state = currentGeneration ? 'linked' : 'unlinked';
+        } catch { state = 'offline'; }
+      }
+      if (state === 'offline' && online && action === 'bind') state = 'unlinked';
+      if (error.connectionFailure || !online) {
+        state = 'offline';
+        result = 'connection_' + (error.connectionFailure || 'unknown');
+      }
+    }
+    if (lastRequest === input[0]) {
+      if (!profileProtocol && result === 'synced') result = action === 'language' ? 'language' : 'notifications';
+      nativeReply(id, state, result, timing);
+    }
+  }
+  window.addEventListener('hashchange', handleNative);
+  handleNative();
+} else if (view === 'match') {
+  document.querySelector('main').hidden = true;
+  window.addEventListener('hashchange', reportMatch);
+  reportMatch();
+} else if (view === 'commands') {
+  document.querySelector('main').hidden = true;
+  commandLoop(labPanel);
+} else if (view === 'result') {
+  document.querySelector('main').hidden = true;
+  commandResultLoop();
+} else if (view === 'roster') {
+  document.querySelector('main').hidden = true;
+  rosterLoop();
+} else if (view === 'state') {
+  document.querySelector('main').hidden = true;
+  queueStateLoop();
+} else {
+  const restored = displayProfile();
+  known = !!restored.revision;
+  render();
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !languagePickerOpen) return;
+    languagePickerOpen = false;
+    render();
+    element('language').focus();
+  });
+  run(refresh);
+  setInterval(() => run(refresh), 7000);
+}
+
+</script>
+<script>
+/* Shared between the Panorama UI and the local store. No engine dependencies. */
+var TelelockRosterCore = (function () {
+    'use strict';
+    function normalize(value) {
+        if (!value || value.version !== 1 || typeof value.random !== 'boolean' || !Array.isArray(value.heroes) || value.heroes.length > 80)
+            throw new Error('Некорректный формат набора');
+        var seen = {}, heroes = value.heroes.map(function (hero) {
+            if (!hero || !Number.isInteger(hero.id) || hero.id <= 0 || hero.id > 10000 || seen[hero.id] ||
+                [-1, 0, 1, 2].indexOf(hero.priority) < 0) throw new Error('Некорректный герой или повтор ID');
+            seen[hero.id] = true;
+            return { id: hero.id, priority: hero.priority };
+        }).sort(function (a, b) { return a.id - b.id; });
+        if (!value.random && !heroes.some(function (hero) { return hero.priority >= 0; }))
+            throw new Error('Выберите хотя бы одного героя');
+        return { version: 1, random: value.random, heroes: heroes };
+    }
+    function name(value) {
+        if (typeof value !== 'string') throw new Error('Введите название');
+        value = value.trim();
+        if (!value || value.length > 32 || /[\x00-\x1f\x7f]/.test(value)) throw new Error('Название: от 1 до 32 символов');
+        return value;
+    }
+    function equal(a, b) { return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b)); }
+    // -2 = unselected, -1 = avoided, 0 = selected, 1 = priority, 2 = high priority.
+    // Add desired heroes before clearing old ones. Read real classes after each action.
+    function next(states, target, random) {
+        target = normalize(target);
+        var desired = {}, ids = Object.keys(states).map(Number).sort(function (a,b) { return a-b; });
+        target.heroes.forEach(function (h) {
+            if (!Object.prototype.hasOwnProperty.call(states, h.id)) throw new Error('Герой '+h.id+' отсутствует на этом экране');
+            desired[h.id] = h.priority;
+        });
+        if (random) {
+            var same=ids.every(function(id) {return states[id] === (Object.prototype.hasOwnProperty.call(desired,id)?desired[id]:-2);});
+            if (target.random && same) return null;
+            return { kind: 'random' };
+        }
+        for (var i=0;i<ids.length;i++) {
+            var id=ids[i], want=desired[id], have=states[id];
+            if (want >= 0 && have < 0) return { id:id, kind:have === -1 ? 'ban' : 'select' };
+        }
+        for (var j=0;j<ids.length;j++) {
+            var hero=ids[j], wanted=Object.prototype.hasOwnProperty.call(desired,hero) ? desired[hero] : -2, current=states[hero];
+            if (wanted === current) continue;
+            if (current === -1) return { id:hero, kind:'ban' };
+            if (wanted < 0 && current >= 0) return { id:hero, kind:'select' };
+            if (wanted === -1) return { id:hero, kind:'ban' };
+            if (current >= 0 && wanted >= 0) return { id:hero, kind:'priority' };
+        }
+        return target.random ? { kind:'random' } : null;
+    }
+    return { normalize:normalize, name:name, equal:equal, next:next };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = TelelockRosterCore;
+
+</script>
+<script>
+/* Runs in CEF. Presets never leave this browser profile. */
+var TelelockRosterBrowserStore = (function () {
+    'use strict';
+    function create(storage, core, uuid) {
+        var key='prelock_roster_presets_v1',preferencesKey='prelock_roster_preferences_v1';
+        function read() {
+            var raw;
+            try {raw=storage.getItem(key);} catch(e) {throw Error('Хранилище Chromium недоступно');}
+            if(raw===null) return {version:1,presets:[]};
+            var data;
+            try {data=JSON.parse(raw);} catch(e) {throw Error('Файл пресетов повреждён; сохранённые данные не изменены');}
+            if(!data || data.version!==1 || !Array.isArray(data.presets) || data.presets.length>32) throw Error('Неизвестный формат пресетов; данные не изменены');
+            var seen={};
+            data.presets=data.presets.map(function(p) {
+                if(!p || typeof p.id!=='string' || !/^[a-f0-9-]{36}$/.test(p.id) || seen[p.id]) throw Error('Повреждён ID пресета');
+                seen[p.id]=true;
+                return {id:p.id,name:core.name(p.name),snapshot:core.normalize(p.snapshot)};
+            });
+            return data;
+        }
+        function execute(action,body) {
+            body=body||{};
+            if(action==='preferences_get') {
+                var rawPreferences;
+                try {rawPreferences=storage.getItem(preferencesKey);}catch(e){throw Error('Хранилище Chromium недоступно');}
+                if(rawPreferences===null)return {locale:'en'};
+                var preferences;
+                try {preferences=JSON.parse(rawPreferences);}catch(e){throw Error('Настройки интерфейса повреждены');}
+                if(!preferences||preferences.version!==1||['en','ru'].indexOf(preferences.locale)<0)throw Error('Настройки интерфейса повреждены');
+                return {locale:preferences.locale};
+            }
+            if(action==='preferences_set') {
+                if(['en','ru'].indexOf(body.locale)<0)throw Error('Некорректный язык интерфейса');
+                try {storage.setItem(preferencesKey,JSON.stringify({version:1,locale:body.locale}));}
+                catch(e){throw Error('Не удалось сохранить язык интерфейса');}
+                return {saved:true,locale:body.locale};
+            }
+            var data=read(),record,index;
+            if(action==='library_get') return data;
+            if(action==='library_set') {
+                // Validate with the same reader before touching persistent storage.
+                var encoded=JSON.stringify(body.library), validated=create({getItem:function(){return encoded;}},core,uuid).execute('library_get');
+                try {storage.setItem(key,JSON.stringify(validated));}catch(e){throw Error('Не удалось сохранить пресет на этом ПК');}
+                return {saved:true};
+            }
+            if(action==='list') return data.presets.map(function(p) {return {id:p.id,name:p.name,count:p.snapshot.heroes.filter(function(h){return h.priority>=0;}).length,random:p.snapshot.random};});
+            if(action==='get') {
+                record=data.presets.filter(function(p){return p.id===body.id;})[0];
+                if(!record) throw Error('Пресет не найден');
+                return record;
+            }
+            if(action==='create') {
+                if(data.presets.length>=32) throw Error('Можно сохранить не более 32 пресетов');
+                var name=core.name(body.name);
+                if(data.presets.some(function(p){return p.name.toLocaleLowerCase()===name.toLocaleLowerCase();})) throw Error('Такое название уже есть');
+                record={id:uuid(),name:name,snapshot:core.normalize(body.snapshot)};
+                data.presets.push(record);
+            } else if(action==='rename' || action==='update') {
+                record=data.presets.filter(function(p){return p.id===body.id;})[0];
+                if(!record)throw Error('Пресет не найден');
+                var nextName=core.name(body.name===undefined?record.name:body.name);
+                if(data.presets.some(function(p){return p.id!==record.id&&p.name.toLocaleLowerCase()===nextName.toLocaleLowerCase();}))throw Error('Такое название уже есть');
+                record.name=nextName;
+                if(action==='update')record.snapshot=core.normalize(body.snapshot);
+            } else if(action==='delete') {
+                index=data.presets.map(function(p){return p.id;}).indexOf(body.id);
+                if(index<0) throw Error('Пресет не найден');
+                data.presets.splice(index,1);
+            } else throw Error('Неизвестное действие');
+            // Acknowledgement means localStorage accepted the durable write.
+            // Never pretend an in-memory fallback is a persistent save.
+            try {
+                var previous=storage.getItem(key);
+                if(previous!==null) storage.setItem(key+'_backup',previous);
+                storage.setItem(key,JSON.stringify(data));
+            } catch(e) {throw Error('Не удалось сохранить пресет на этом ПК');}
+            return {saved:true,id:record?record.id:body.id};
+        }
+        return {execute:execute,key:key};
+    }
+    return {create:create};
+})();
+if(typeof module!=='undefined' && module.exports) module.exports=TelelockRosterBrowserStore;
+
+</script>
+<script>
+/* One atomic local record contains the library and its cloud outbox. */
+var TelelockPrelockSync = (function () {
+    'use strict';
+    function create(options) {
+        var key='telelock_prelock_v1',running=null,lastError='';
+        var storage=options.storage,core=options.core,uuid=options.uuid;
+        function validate(presets) {
+            return options.browserStore.create({getItem:function(){return JSON.stringify({version:1,presets:presets});}},core,uuid).execute('library_get').presets;
+        }
+        function read() {
+            var raw=storage.getItem(key);
+            if(raw===null) {
+                var legacy=options.browserStore.create(storage,core,uuid).execute('library_get');
+                return {version:1,scope:options.scope,generation:null,adopted:false,revision:0,presets:legacy.presets,pending:[],results:[]};
+            }
+            var value=JSON.parse(raw);
+            if(value.version!==1 || value.scope!==options.scope || !Array.isArray(value.pending) || !Array.isArray(value.results))throw Error('Настройки синхронизации повреждены');
+            validate(value.presets);
+            return value;
+        }
+        function write(value) {
+            try {storage.setItem(key,JSON.stringify(value));}catch(e){throw Error('Не удалось сохранить пресет на этом ПК');}
+        }
+        function overlay(presets,pending) {
+            presets=JSON.parse(JSON.stringify(presets));
+            pending.forEach(function(op){
+                var index=presets.map(function(p){return p.id;}).indexOf(op.id);
+                if(op.operation==='create') {if(!presets.some(function(p){return p.id===op.preset.id;}))presets.push(op.preset);}
+                else if(op.operation==='delete') {if(index>=0)presets.splice(index,1);}
+                else if(index>=0)presets[index]=op.preset;
+            });
+            return validate(presets);
+        }
+        function mutate(action,body) {
+            var state=read(),before=JSON.parse(JSON.stringify(state.presets));
+            var memory=JSON.stringify({version:1,presets:before});
+            var local=options.browserStore.create({getItem:function(k){return k==='prelock_roster_presets_v1'?memory:null;},setItem:function(k,v){if(k==='prelock_roster_presets_v1')memory=v;}},core,uuid);
+            var result=local.execute(action,body),after=JSON.parse(memory).presets;
+            var op={request:uuid(),operation:action,id:result.id};
+            if(action==='create')op.preset=after.filter(function(p){return p.id===result.id;})[0];
+            else {
+                op.expected=before.filter(function(p){return p.id===body.id;})[0];
+                if(action==='rename' || action==='update') {op.preset=after.filter(function(p){return p.id===body.id;})[0];op.name=op.preset.name;}
+            }
+            state.presets=after;state.pending.push(op);write(state);pump();return result;
+        }
+        async function synchronize() {
+            var profile=await options.profile();
+            var state=read();
+            if(!profile.generation)return;
+            if(state.generation!==profile.generation) {
+                if(state.adopted) {
+                    storage.setItem(key+'_previous_binding',JSON.stringify(state));
+                    state={version:1,scope:options.scope,generation:profile.generation,adopted:true,revision:0,presets:[],pending:[],results:[]};
+                } else {
+                    state.generation=profile.generation;state.adopted=true;
+                    state.presets.forEach(function(p){if(!state.pending.some(function(op){return op.operation==='create'&&op.preset.id===p.id;}))state.pending.unshift({request:uuid(),operation:'create',preset:p});});
+                }
+                write(state);
+            }
+            var generation=state.generation;
+            async function call(change) {return options.api({generation:generation,change:change});}
+            var remote=await call({operation:'read'});
+            state=read();if(state.generation!==generation)return;
+            state.presets=overlay(remote.presets,state.pending);state.revision=remote.revision;write(state);
+            for(var count=0;count<64;count++) {
+                state=read();if(state.generation!==generation)return;
+                if(!state.pending.length)break;
+                var op=state.pending[0],change=Object.assign({},op,{revision:state.revision});
+                // Persist the request bytes before sending so a lost reply retries identically.
+                if(op.sent)change=op.sent;
+                else {op.sent=change;write(state);}
+                try {remote=await call(change);}catch(error) {
+                    // A revision conflict is known to have made no change. Rebase once on the next poll.
+                    if(error.httpStatus===409 && error.result && Array.isArray(error.result.presets)) {
+                        state=read();if(state.generation!==generation)return;
+                        var queued=state.pending.filter(function(p){return p.request===op.request;})[0];
+                        if(queued)delete queued.sent;
+                        state.revision=error.result.revision;state.presets=overlay(error.result.presets,state.pending);write(state);
+                    }
+                    throw error;
+                }
+                state=read();if(state.generation!==generation)return;
+                state.pending=state.pending.filter(function(p){return p.request!==op.request;});
+                state.revision=remote.revision;state.presets=overlay(remote.presets,state.pending);write(state);
+            }
+            state=read();
+            for(var i=0;i<state.results.length;i++) {
+                var result=state.results[i];await call({operation:'result',id:result.id,status:result.status});
+                var current=read();if(current.generation!==generation)return;
+                current.results=current.results.filter(function(r){return r.id!==result.id;});write(current);
+            }
+        }
+        function pump() {
+            if(!running)running=synchronize().then(function(){lastError='';},function(error){lastError=String(error.message||error);}).finally(function(){running=null;});
+            return running;
+        }
+        function execute(action,body) {
+            body=body||{};
+            if(['create','delete','rename','update'].indexOf(action)>=0)return mutate(action,body);
+            if(action==='remote_take') {
+                pump();
+                var state=read();if(!state.generation||state.pending.length)return {command:null};
+                return options.api({generation:state.generation,change:{operation:'claim'}});
+            }
+            if(action==='remote_result') {
+                if(!/^[a-f0-9-]{36}$/.test(body.id)||['applied','failed'].indexOf(body.status)<0)throw Error('Некорректный результат');
+                var state=read();state.results=state.results.filter(function(r){return r.id!==body.id;});state.results.push({id:body.id,status:body.status});write(state);pump();return {saved:true};
+            }
+            var state=read();pump();
+            if(action==='sync_status')return {pending:state.pending.length,error:lastError};
+            var memory=JSON.stringify({version:1,presets:state.presets});
+            return options.browserStore.create({getItem:function(){return memory;}},core,uuid).execute(action,body);
+        }
+        return {execute:execute,pump:pump,read:read};
+    }
+    return {create:create};
+})();
+if(typeof module!=='undefined'&&module.exports)module.exports=TelelockPrelockSync;
+
+</script>
+<script>
+/* Loaded after the regular Telelock panel runtime; shares its installation and profile. */
+(function () {
+    'use strict';
+    var sync=TelelockPrelockSync.create({storage:localStorage,core:TelelockRosterCore,
+        browserStore:TelelockRosterBrowserStore,uuid:function(){return crypto.randomUUID();},scope:profileScope,
+        profile:async function(){var profile=await refreshProfile();await syncPreferences();return profile;},
+        api:async function(body){
+            // Keep structured conflicts available to the outbox without changing the legacy API helper.
+            var response=await fetch(new URL('/v1/prelock',profileScope||location.origin),{
+                method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json',Authorization:'Bearer '+await installationKey()},
+                body:JSON.stringify(body),signal:AbortSignal.timeout(8000)});
+            var result=await response.json();
+            if(!response.ok)throw Object.assign(Error(result.error||'Preset sync failed'),{httpStatus:response.status,result:result});
+            return result;
+        }});
+    window.TelelockPrelockExecute=function(action,body){
+        if(action==='preferences_get')return {locale:readProfile().language};
+        if(action==='preferences_set') {
+            saveLocalPreference('language',body.locale);sync.pump();
+            return {saved:true,locale:body.locale};
+        }
+        var result=sync.execute(action,body);
+        if(action==='sync_status')result.connected=!!readProfile().generation;
+        return result;
+    };
+    // Prime sync only after the browser can answer Panorama requests.
+    setTimeout(function(){sync.pump();},0);
+})();
+
+</script>
+<script>
+(function () {
+    'use strict';
+    var session=new URLSearchParams(location.search).get('session');
+    if(!/^[a-z0-9-]{1,80}$/.test(session||''))return;
+    var current=null,outgoing=null,completed=null,processing=null;
+    function uuid() {
+        if(typeof crypto!=='undefined' && crypto.randomUUID)return crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){var r=Math.floor(Math.random()*16);return(c==='x'?r:(r&3)|8).toString(16);});
+    }
+    // Access can itself throw when CEF denies storage. Report it on the request.
+    var store;
+    function storage() {
+        if(!store)store=TelelockRosterBrowserStore.create(window.localStorage,TelelockRosterCore,uuid);
+        return store;
+    }
+    function title(value) {document.title='rp2:'+session+':'+value;}
+    function responsePart(index) {
+        title('res:'+outgoing.id+':'+index+':'+outgoing.parts.length+':'+outgoing.parts[index]);
+    }
+    function respond(id,payload) {
+        var text=encodeURIComponent(JSON.stringify(payload)),parts=[];
+        for(var i=0;i<text.length;i+=1400)parts.push(text.slice(i,i+1400));
+        outgoing={id:id,parts:parts};completed={id:id,payload:payload};responsePart(0);
+    }
+    function receive() {
+        var hash=location.hash.slice(1),ack=/^rp2ack:(\d+):(\d+)$/.exec(hash);
+        if(ack) {var index=Number(ack[2]);if(outgoing&&outgoing.id===Number(ack[1])&&index+1<outgoing.parts.length)responsePart(index+1);return;}
+        var match=/^rp2:(\d+):(\d+):(\d+):([\s\S]*)$/.exec(hash);
+        if(!match)return;
+        var id=Number(match[1]),part=Number(match[2]),total=Number(match[3]);
+        if(!Number.isSafeInteger(id)||id<=0||total<1||total>72||part>=total||match[4].length>1400)return;
+        if(completed&&completed.id===id) {respond(id,completed.payload);return;}
+        if(processing!==null)return;
+        if(!current || current.id!==id) {if(part!==0)return;current={id:id,total:total,parts:[]};}
+        if(current.total!==total)return;
+        if(part<current.parts.length) {title('ack:'+id+':'+part);return;}
+        if(part!==current.parts.length)return;
+        current.parts.push(match[4]);
+        if(current.parts.length<total) {title('ack:'+id+':'+part);return;}
+        try {
+            var request=JSON.parse(decodeURIComponent(current.parts.join('')));
+            if(request.id!==id)throw Error('Некорректный запрос');
+            var result=window.TelelockPrelockExecute?window.TelelockPrelockExecute(request.action,request.body):storage().execute(request.action,request.body);
+            if(result&&typeof result.then==='function') {
+                processing=id;
+                result.then(function(value){respond(id,{ok:true,result:value});},function(error){respond(id,{ok:false,error:String(error.message||error)});}).finally(function(){processing=null;});
+            } else respond(id,{ok:true,result:result});
+        } catch(error) {respond(id,{ok:false,error:String(error.message||error)});}
+        current=null;
+    }
+    window.addEventListener('hashchange',receive);
+    title('ready');
+    if(location.hash)receive();
+})();
+
+</script>

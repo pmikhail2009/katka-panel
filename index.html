@@ -80,7 +80,7 @@ let lastPing = null;
 const labPanel = new URLSearchParams(location.search).get('lab') === '1';
 const labStrategies = ['baseline', 'cached', 'lean'];
 let accessTier = 'free';
-const fullAccess = () => accessTier === 'owner' || accessTier === 'test';
+const fullAccess = () => true;
 
 let language = 'en';
 let languagePickerOpen = false;
@@ -179,11 +179,11 @@ async function refreshProfile(timing) {
   const fresh = changed || profile.revision === before.revision;
   if (fresh && !profile.pending.language && ['en', 'ru'].includes(current.language)) profile.language = current.language;
   if (fresh && !profile.pending.notifications && ['on', 'off', 'auto'].includes(current.settings?.mode)) profile.mode = current.settings.mode;
-  if (profile.tier === 'free') { delete profile.pending.notifications; profile.mode = 'auto'; }
   if (!profile.generation) profile.pending = {};
   writeProfile(profile);
   known = true;
-  await observeGeneration(profile.generation);
+  // The command controller reconciles its mailbox against its own server poll.
+  // Displaying a verified connection must not wait for that IndexedDB mailbox.
   return displayProfile(profile);
 }
 async function syncPreferences() {
@@ -457,8 +457,6 @@ async function bindInstallation(code) {
       const result = await api('bind', {code});
       if (!active) return;
       if (typeof result.generation === 'string' && /^[a-f0-9]{32}$/.test(result.generation)) {
-        await withTimeout(resetCommands(), 10000, 'storage');
-        if (!active) return;
         return result;
       }
       if (!result.pending) break;
@@ -726,7 +724,9 @@ async function reportMatch() {
   }
 }
 const view = new URLSearchParams(location.search).get('view');
-if (view === 'native') {
+if (view === 'prelock') {
+  document.querySelector('main').hidden = true;
+} else if (view === 'native') {
   document.querySelector('main').hidden = true;
   const profileProtocol = new URLSearchParams(location.search).get('profile') === '1';
   let lastRequest;
@@ -737,10 +737,11 @@ if (view === 'native') {
     if (!profileProtocol && state.indexOf('cached_') === 0) return;
     const profile = readProfile();
     const title = ['native', id, state, result, online && lastPing !== null ? lastPing : 'none',
-      profile.tier === 'free' ? 'auto' : profile.mode, accessTier, language];
+      profile.mode, accessTier, language];
     if (timing) title.push(['lab', timing.http ?? 'none', timing.gateway ?? 'none', timing.browser ?? 'none'].join(','));
     if (profileProtocol) title.push('pending,' + Number(!!profile.pending.language) + ',' + Number(!!profile.pending.notifications));
-    document.title = title.join(':');
+    const next = title.join(':');
+    if (document.title !== next) document.title = next;
   }
   async function handleNative() {
     const input = /^#(\d+):(status|bind|test|unlink|notifications|language):([A-F0-9]{0,16}|on|off|auto|en|ru|baseline|cached|lean)$/.exec(location.hash);
@@ -784,6 +785,7 @@ if (view === 'native') {
         if (lastRequest === input[0]) {
           currentGeneration = current.generation;
         }
+        if (action === 'status' && lastRequest === input[0]) nativeReply(id, state, result, timing);
         await syncPreferences();
         if (action === 'test') {
           await testNotification(current.generation, started);
@@ -792,6 +794,11 @@ if (view === 'native') {
       }
     } catch (error) {
       result = action === 'test' ? 'test_failed' : action === 'language' ? 'language_failed' : 'rejected';
+      if (action === 'bind' && new URLSearchParams(location.search).get('errors') === '1') {
+        if (error.httpStatus === 400) result = 'pairing_expired';
+        else if (error.httpStatus === 409) result = 'pairing_changed';
+        else if (error.httpStatus === 503) result = 'pairing_unavailable';
+      }
       if (action === 'unlink' && error.httpStatus === 409) result = 'unlink_changed';
       if (error.httpStatus === 409 && ['language', 'notifications', 'unlink'].includes(action)) {
         try {
