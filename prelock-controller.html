@@ -1083,8 +1083,8 @@ if(typeof module!=='undefined'&&module.exports)module.exports=TelelockPrelockSyn
             // Keep structured conflicts available to the outbox without changing the legacy API helper.
             try {
             var response=await fetch(new URL('/v1/prelock',profileScope||location.origin),{
-                method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json',Authorization:'Bearer '+await installationKey()},
-                body:JSON.stringify(body),signal:AbortSignal.timeout(8000)});
+                method:'POST',cache:'default',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json',Authorization:'Bearer '+await installationKey()},
+                body:JSON.stringify(body),signal:AbortSignal.timeout(25000)});
             var result=await response.json();
             if(!response.ok)throw Object.assign(Error(result.error||'Preset sync failed'),{httpStatus:response.status,result:result});
             return result;
