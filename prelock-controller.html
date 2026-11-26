@@ -932,7 +932,7 @@ if(typeof module!=='undefined' && module.exports) module.exports=TelelockRosterB
 var TelelockPrelockSync = (function () {
     'use strict';
     function create(options) {
-        var key='telelock_prelock_v1',running=null,lastError='';
+        var key='telelock_prelock_v1',running=null,lastError='',claiming=null,claimed=null,claimError='',claimRetryAt=0;
         var storage=options.storage,core=options.core,uuid=options.uuid;
         function validate(presets) {
             return options.browserStore.create({getItem:function(){return JSON.stringify({version:1,presets:presets});}},core,uuid).execute('library_get').presets;
@@ -1025,20 +1025,43 @@ var TelelockPrelockSync = (function () {
             if(!running)running=synchronize().then(function(){lastError='';},function(error){lastError=String(error.message||error);}).finally(function(){running=null;});
             return running;
         }
+        function takeRemote() {
+            var state=read();pump();
+            if(!state.generation || state.pending.length)return {command:null};
+            if(claimed) {
+                var ready=claimed;claimed=null;
+                if(ready.generation===state.generation) {
+                    if(ready.command.expires>Date.now())return {command:ready.command};
+                    execute('remote_result',{id:ready.command.id,status:'failed'});
+                }
+            }
+            if(Date.now()<claimRetryAt)return {command:null};
+            if(!claiming) {
+                var generation=state.generation;
+                // The Panorama bridge must always remain free for local saves.
+                // Claim in the background and deliver at most once on a later poll.
+                claiming=Promise.resolve().then(function(){
+                    return options.api({generation:generation,change:{operation:'claim'}});
+                }).then(function(reply){
+                    if(read().generation!==generation)return;
+                    claimError='';claimRetryAt=0;
+                    if(reply.command)claimed={generation:generation,command:reply.command};
+                }).catch(function(error){claimError=String(error.message||error);claimRetryAt=Date.now()+10000;}).finally(function(){claiming=null;});
+            }
+            return {command:null,pending:true};
+        }
         function execute(action,body) {
             body=body||{};
             if(['create','delete','rename','update'].indexOf(action)>=0)return mutate(action,body);
             if(action==='remote_take') {
-                pump();
-                var state=read();if(!state.generation||state.pending.length)return {command:null};
-                return options.api({generation:state.generation,change:{operation:'claim'}});
+                return takeRemote();
             }
             if(action==='remote_result') {
                 if(!/^[a-f0-9-]{36}$/.test(body.id)||['applied','failed'].indexOf(body.status)<0)throw Error('Некорректный результат');
                 var state=read();state.results=state.results.filter(function(r){return r.id!==body.id;});state.results.push({id:body.id,status:body.status});write(state);pump();return {saved:true};
             }
             var state=read();pump();
-            if(action==='sync_status')return {pending:state.pending.length,error:lastError};
+            if(action==='sync_status')return {pending:state.pending.length,error:lastError||claimError};
             var memory=JSON.stringify({version:1,presets:state.presets});
             return options.browserStore.create({getItem:function(){return memory;}},core,uuid).execute(action,body);
         }
@@ -1058,12 +1081,19 @@ if(typeof module!=='undefined'&&module.exports)module.exports=TelelockPrelockSyn
         profile:async function(){var profile=await refreshProfile();await syncPreferences();return profile;},
         api:async function(body){
             // Keep structured conflicts available to the outbox without changing the legacy API helper.
+            try {
             var response=await fetch(new URL('/v1/prelock',profileScope||location.origin),{
                 method:'POST',credentials:'omit',redirect:'error',headers:{'Content-Type':'application/json',Authorization:'Bearer '+await installationKey()},
                 body:JSON.stringify(body),signal:AbortSignal.timeout(8000)});
             var result=await response.json();
             if(!response.ok)throw Object.assign(Error(result.error||'Preset sync failed'),{httpStatus:response.status,result:result});
             return result;
+            } catch(error) {
+                if(error.name==='TimeoutError'||error.name==='AbortError'||error instanceof TypeError)
+                    throw Error(t('Sync unavailable; presets are saved on this PC',
+                        'Синхронизация недоступна; пресеты сохранены на ПК'));
+                throw error;
+            }
         }});
     window.TelelockPrelockExecute=function(action,body){
         if(action==='preferences_get')return {locale:readProfile().language};
